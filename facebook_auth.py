@@ -338,38 +338,38 @@ async def handle_facebook_login(page: Page, email: str = None, password: str = N
             except Exception as e_close:
                 logger.debug(f"[AUTH] Sekme temizliği sırasında uyarı (önemsiz): {e_close}")
                 
-            logger.info("[AUTH] Ana sekmeye başarıyla dönüldü.")
+        logger.info("[AUTH] Ana sekmeye başarıyla dönüldü.")
+        try:
+            logger.info("[AUTH] Girişin web sitesine yansıması bekleniyor (Sign In butonunun kaybolması)...")
+            # Butonun kaybolmasını 15 saniyeye kadar bekle
+            sign_btn = page.locator("button.c-nav-sign").first
+            await sign_btn.wait_for(state="hidden", timeout=15000)
+            logger.info("[AUTH] Sign In butonu kayboldu, sisteme başarıyla giriş yapıldı!")
+            
+            # Başarılı olunca güncel cookie'yi kaydet
             try:
-                logger.info("[AUTH] Girişin web sitesine yansıması bekleniyor (Sign In butonunun kaybolması)...")
-                # Butonun kaybolmasını 15 saniyeye kadar bekle
-                sign_btn = page.locator("button.c-nav-sign").first
-                await sign_btn.wait_for(state="hidden", timeout=15000)
-                logger.info("[AUTH] Sign In butonu kayboldu, sisteme başarıyla giriş yapıldı!")
+                os.makedirs(os.path.dirname(os.path.abspath(target_cookies_file)), exist_ok=True)
+                current_cookies = await page.context.cookies()
+                with open(target_cookies_file, "w", encoding="utf-8") as f:
+                    json.dump(current_cookies, f, indent=2)
+                logger.info(f"[AUTH] Yeni cookieler başarıyla '{target_cookies_file}' dosyasına kaydedildi.")
+            except Exception as e_cook:
+                logger.warning(f"[AUTH] Cookieler kaydedilirken hata oluştu: {e_cook}")
+            return True
                 
-                # Başarılı olunca güncel cookie'yi kaydet
+        except Exception:
+            logger.warning("[AUTH] Sign In butonu kaybolmadı. Facebook üzerinden giriş başarısız olmuş olabilir.")
+            if os.path.exists(target_cookies_file):
+                logger.info("[AUTH] Giriş başarısız olduğundan hazırda olan eski cookieler zorla yükleniyor...")
                 try:
-                    os.makedirs(os.path.dirname(os.path.abspath(target_cookies_file)), exist_ok=True)
-                    current_cookies = await page.context.cookies()
-                    with open(target_cookies_file, "w", encoding="utf-8") as f:
-                        json.dump(current_cookies, f, indent=2)
-                    logger.info(f"[AUTH] Yeni cookieler başarıyla '{target_cookies_file}' dosyasına kaydedildi.")
-                except Exception as e_cook:
-                    logger.warning(f"[AUTH] Cookieler kaydedilirken hata oluştu: {e_cook}")
-                return True
-                    
-            except Exception:
-                logger.warning("[AUTH] Sign In butonu kaybolmadı. Facebook üzerinden giriş başarısız olmuş olabilir.")
-                if os.path.exists(target_cookies_file):
-                    logger.info("[AUTH] Giriş başarısız olduğundan hazırda olan eski cookieler zorla yükleniyor...")
-                    try:
-                        with open(target_cookies_file, "r", encoding="utf-8") as f:
-                            old_cookies = json.load(f)
-                        await page.context.add_cookies(old_cookies)
-                        await page.reload()
-                        logger.info("[AUTH] Eski hazır cookieler geri yüklendi.")
-                    except Exception as e_rec:
-                        logger.warning(f"[AUTH] Eski cookielerin geri yüklenmesinde hata: {e_rec}")
-                return False
+                    with open(target_cookies_file, "r", encoding="utf-8") as f:
+                        old_cookies = json.load(f)
+                    await page.context.add_cookies(old_cookies)
+                    await page.reload()
+                    logger.info("[AUTH] Eski hazır cookieler geri yüklendi.")
+                except Exception as e_rec:
+                    logger.warning(f"[AUTH] Eski cookielerin geri yüklenmesinde hata: {e_rec}")
+            return False
                 
     else:
         logger.info("[AUTH] Facebook butonu bulunamadı/tıklanmadı.")
