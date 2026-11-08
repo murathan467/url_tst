@@ -3,8 +3,12 @@ name: Cloud Task Sync Worker
 on:
   workflow_dispatch:
   schedule:
-    # Her 6 saatte bir otomatik başlar (GitHub Actions maksimum job süresi 6 saattir)
-    - cron: '0 */6 * * *'
+    # Her 3 saatte bir tetikleme (Önceki job çalışıyorsa concurrency sayesinde kuyruğa alınır ve süre bitince anında başlar)
+    - cron: '0 */3 * * *'
+
+permissions:
+  contents: write
+  actions: write
 
 concurrency:
   group: sync-worker-runner
@@ -13,7 +17,7 @@ concurrency:
 jobs:
   run-worker:
     runs-on: ubuntu-latest
-    timeout-minutes: 355 # 6 saatlik (360 dk) sert limitten hemen önce güvenli kapanış
+    timeout-minutes: 355 # 6 saatlik sert sınırdan hemen önce güvenli bitiş
 
     steps:
       - name: Repo Kodlarını Çek
@@ -34,12 +38,20 @@ jobs:
         env:
           SESSION_COOKIES: ${{ secrets.SESSION_COOKIES }}
         run: |
-          if [ -n "$SESSION_COOKIES" ]; then
-            echo "$SESSION_COOKIES" > session_cookies.json
-            echo "session_cookies.json başarıyla oluşturuldu."
-          else
-            echo "Kayıtlı oturum bulunamadı, otomatik giriş denenecek."
-          fi
+          python -c "
+          import os, json
+          raw = os.environ.get('SESSION_COOKIES', '').strip()
+          if raw:
+              try:
+                  data = json.loads(raw)
+                  with open('session_cookies.json', 'w', encoding='utf-8') as f:
+                      json.dump(data, f)
+                  print('session_cookies.json başarıyla oluşturuldu.')
+              except Exception as e:
+                  print(f'Uyarı: SESSION_COOKIES JSON formatı okunamadı: {e}')
+          else:
+              print('Kayıtlı oturum bulunamadı, form girişi denenecek.')
+          "
 
       - name: Senkronizasyon İşçisini Çalıştır (5 Saat 45 Dakika)
         env:
@@ -51,13 +63,22 @@ jobs:
           FB_PASSWORD: ${{ secrets.FB_PASSWORD }}
           TARGET_BASE_URL: ${{ secrets.TARGET_BASE_URL }}
         run: |
-          echo "Worker başlatılıyor..."
-          timeout -s SIGINT 345m python main_local.py || true
+          echo "Worker 5 saat 45 dakika boyunca çalışacak şekilde başlatılıyor..."
+          end=$((SECONDS+20700))
+          while [ $SECONDS -lt $end ]; do
+            remaining=$((end-SECONDS))
+            echo "Kalan çalışma süresi: $remaining saniye..."
+            timeout -s SIGINT ${remaining}s python main_local.py || true
+            if [ $SECONDS -lt $end ]; then
+              echo "İşlem kapandı. 5 saniye içinde otomatik yeniden başlatılıyor..."
+              sleep 5
+            fi
+          done
 
       - name: Süre Dolduğunda Yeni Döngüyü Otomatik Tetikle (7/24 Kesintisiz)
         if: always()
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.AUTO_RESTART_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
-          echo "Mevcut çalışma süresi tamamlandı, yeni iş (job) tetikleniyor..."
-          gh workflow run bot.yml || true
+          echo "Mevcut süre tamamlandı, yeni döngü başlatılıyor..."
+          gh workflow run bot.yml --repo ${{ github.repository }} --ref main || true
