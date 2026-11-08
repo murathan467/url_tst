@@ -175,7 +175,8 @@ async def main_async():
         logger.critical(f"Veritabanı başlatılamadı: {e}")
         sys.exit(1)
         
-    send_startup_message()
+    node_name = os.getenv("NODE_NAME", "Worker Node")
+    send_startup_message(node_name)
     
     scraper = DataScraper()
     try:

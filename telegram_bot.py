@@ -76,11 +76,11 @@ def send_notification(skin_name: str, seller: str, link: str, wear_value: str = 
         logger.error(f"Telegram mesaj gönderim hatası: {e}")
 
 
-def send_startup_message():
-    """Bot başlatıldığında bilgi mesajı gönderir."""
+def send_startup_message(title: str = "Cloud Sync Worker"):
+    """Bot veya worker başlatıldığında bilgi mesajı gönderir."""
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": "🤖 *Cloud Sync Worker başlatıldı!*\n\nYeni kayıtlar taranıyor...",
+        "text": f"🤖 *{_escape_markdown(title)} başlatıldı!*\n\nİşlem döngüsü aktif...",
         "parse_mode": "Markdown"
     }
     try:
