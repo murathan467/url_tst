@@ -1,0 +1,158 @@
+name: Cloud Task Full Cluster (All-in-One)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Her 3 saatte bir yedek tetikleme
+    - cron: '0 */3 * * *'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-cluster-runner
+  cancel-in-progress: false
+
+jobs:
+  master-node:
+    name: Master Node (Monitor + 5 Workers)
+    runs-on: ubuntu-latest
+    timeout-minutes: 355 # 6 saatlik sınırdan hemen önce güvenli kapanış
+
+    steps:
+      - name: Repo Kodlarını Çek
+        uses: actions/checkout@v4
+
+      - name: Python 3.12 Kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Kütüphaneleri ve Tarayıcı Motorunu Kur
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Oturum Çerezlerini Yükle (Varsa)
+        env:
+          SESSION_COOKIES: ${{ secrets.SESSION_COOKIES || secrets.BUFF_COOKIES }}
+        run: |
+          python -c "
+          import os, json
+          raw = os.environ.get('SESSION_COOKIES', '').strip()
+          if raw:
+              try:
+                  data = json.loads(raw)
+                  with open('session_cookies.json', 'w', encoding='utf-8') as f:
+                      json.dump(data, f)
+                  print('session_cookies.json başarıyla oluşturuldu.')
+              except Exception as e:
+                  print(f'Uyarı: SESSION_COOKIES JSON formatı okunamadı: {e}')
+          else:
+              print('Kayıtlı oturum bulunamadı, form girişi denenecek.')
+          "
+
+      - name: Master Sunucuyu Çalıştır (5 Saat 45 Dakika)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FB_EMAIL: ${{ secrets.FB_EMAIL }}
+          FB_PASSWORD: ${{ secrets.FB_PASSWORD }}
+          TARGET_BASE_URL: ${{ secrets.TARGET_BASE_URL }}
+        run: |
+          echo "Master Node başlatılıyor (Monitor + 5 Worker)..."
+          end=$((SECONDS+20700))
+          while [ $SECONDS -lt $end ]; do
+            remaining=$((end-SECONDS))
+            echo "Kalan çalışma süresi: $remaining saniye..."
+            timeout -s SIGINT ${remaining}s python main_local.py || true
+            if [ $SECONDS -lt $end ]; then
+              echo "İşlem kapandı. 5 saniye içinde otomatik yeniden başlatılıyor..."
+              sleep 5
+            fi
+          done
+
+  worker-nodes:
+    name: Worker Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [1, 2, 3, 4, 5]
+
+    steps:
+      - name: Repo Kodlarını Çek
+        uses: actions/checkout@v4
+
+      - name: Python 3.12 Kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Kütüphaneleri ve Tarayıcı Motorunu Kur
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Oturum Çerezlerini Yükle (Varsa)
+        env:
+          SESSION_COOKIES: ${{ secrets.SESSION_COOKIES || secrets.BUFF_COOKIES }}
+        run: |
+          python -c "
+          import os, json
+          raw = os.environ.get('SESSION_COOKIES', '').strip()
+          if raw:
+              try:
+                  data = json.loads(raw)
+                  with open('session_cookies.json', 'w', encoding='utf-8') as f:
+                      json.dump(data, f)
+                  print('session_cookies.json başarıyla oluşturuldu.')
+              except Exception as e:
+                  print(f'Uyarı: SESSION_COOKIES JSON formatı okunamadı: {e}')
+          else:
+              print('Kayıtlı oturum bulunamadı, form girişi denenecek.')
+          "
+
+      - name: İşçi Düğümünü Çalıştır (5 Saat 45 Dakika)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FB_EMAIL: ${{ secrets.FB_EMAIL }}
+          FB_PASSWORD: ${{ secrets.FB_PASSWORD }}
+          TARGET_BASE_URL: ${{ secrets.TARGET_BASE_URL }}
+          NODE_NAME: "Worker Node ${{ matrix.node }}"
+        run: |
+          echo "Worker Node ${{ matrix.node }} başlatılıyor (Sadece işçi modu, 5 worker)..."
+          end=$((SECONDS+20700))
+          while [ $SECONDS -lt $end ]; do
+            remaining=$((end-SECONDS))
+            echo "Kalan çalışma süresi: $remaining saniye..."
+            timeout -s SIGINT ${remaining}s python main_vm.py || true
+            if [ $SECONDS -lt $end ]; then
+              echo "İşlem kapandı. 5 saniye içinde otomatik yeniden başlatılıyor..."
+              sleep 5
+            fi
+          done
+
+  restart-cluster:
+    name: Restart Cluster Trigger
+    needs: [master-node, worker-nodes]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repo Kodlarını Çek
+        uses: actions/checkout@v4
+      - name: Yeni Cluster Döngüsünü Başlat
+        env:
+          GH_TOKEN: ${{ secrets.AUTO_RESTART_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Tüm cluster süresini tamamladı, yeni döngü başlatılıyor..."
+          gh workflow run cluster.yml --repo ${{ github.repository }} --ref main || true
