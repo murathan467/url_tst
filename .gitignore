@@ -9,6 +9,9 @@ error_log.txt
 buff_cookies.json
 session_cookies.json
 *cookies.json
+cookies/
+cookie_olusturucu.py
+cookie_olustur.bat
 *.html
 extract_prices_test.py
 test_buff_dom.py

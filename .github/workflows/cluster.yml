@@ -102,17 +102,24 @@ jobs:
 
       - name: Oturum Çerezlerini Yükle (Varsa)
         env:
-          SESSION_COOKIES: ${{ secrets.SESSION_COOKIES || secrets.BUFF_COOKIES }}
+          NODE_ID: ${{ matrix.node }}
+          SESSION_COOKIES_DEFAULT: ${{ secrets.SESSION_COOKIES || secrets.BUFF_COOKIES }}
+          SESSION_COOKIES_1: ${{ secrets.SESSION_COOKIES_1 }}
+          SESSION_COOKIES_2: ${{ secrets.SESSION_COOKIES_2 }}
+          SESSION_COOKIES_3: ${{ secrets.SESSION_COOKIES_3 }}
+          SESSION_COOKIES_4: ${{ secrets.SESSION_COOKIES_4 }}
+          SESSION_COOKIES_5: ${{ secrets.SESSION_COOKIES_5 }}
         run: |
           python -c "
           import os, json
-          raw = os.environ.get('SESSION_COOKIES', '').strip()
+          node_id = os.environ.get('NODE_ID', '1').strip()
+          raw = os.environ.get(f'SESSION_COOKIES_{node_id}', '').strip() or os.environ.get('SESSION_COOKIES_DEFAULT', '').strip()
           if raw:
               try:
                   data = json.loads(raw)
                   with open('session_cookies.json', 'w', encoding='utf-8') as f:
                       json.dump(data, f)
-                  print('session_cookies.json başarıyla oluşturuldu.')
+                  print(f'Node {node_id} için session_cookies.json başarıyla oluşturuldu.')
               except Exception as e:
                   print(f'Uyarı: SESSION_COOKIES JSON formatı okunamadı: {e}')
           else:
@@ -121,15 +128,31 @@ jobs:
 
       - name: İşçi Düğümünü Çalıştır (5 Saat 45 Dakika)
         env:
+          NODE_ID: ${{ matrix.node }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          FB_EMAIL: ${{ secrets.FB_EMAIL }}
-          FB_PASSWORD: ${{ secrets.FB_PASSWORD }}
+          FB_EMAIL_DEFAULT: ${{ secrets.FB_EMAIL }}
+          FB_PASSWORD_DEFAULT: ${{ secrets.FB_PASSWORD }}
+          FB_EMAIL_1: ${{ secrets.FB_EMAIL_1 }}
+          FB_PASSWORD_1: ${{ secrets.FB_PASSWORD_1 }}
+          FB_EMAIL_2: ${{ secrets.FB_EMAIL_2 }}
+          FB_PASSWORD_2: ${{ secrets.FB_PASSWORD_2 }}
+          FB_EMAIL_3: ${{ secrets.FB_EMAIL_3 }}
+          FB_PASSWORD_3: ${{ secrets.FB_PASSWORD_3 }}
+          FB_EMAIL_4: ${{ secrets.FB_EMAIL_4 }}
+          FB_PASSWORD_4: ${{ secrets.FB_PASSWORD_4 }}
+          FB_EMAIL_5: ${{ secrets.FB_EMAIL_5 }}
+          FB_PASSWORD_5: ${{ secrets.FB_PASSWORD_5 }}
           TARGET_BASE_URL: ${{ secrets.TARGET_BASE_URL }}
           NODE_NAME: "Worker Node ${{ matrix.node }}"
         run: |
+          node_id="${NODE_ID}"
+          email_var="FB_EMAIL_${node_id}"
+          pass_var="FB_PASSWORD_${node_id}"
+          export FB_EMAIL="${!email_var:-$FB_EMAIL_DEFAULT}"
+          export FB_PASSWORD="${!pass_var:-$FB_PASSWORD_DEFAULT}"
           echo "Worker Node ${{ matrix.node }} başlatılıyor (Sadece işçi modu, 5 worker)..."
           end=$((SECONDS+20700))
           while [ $SECONDS -lt $end ]; do

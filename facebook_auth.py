@@ -5,27 +5,36 @@ import logging
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
 import asyncio
+import config
 
 logger = logging.getLogger(__name__)
 
 COOKIES_FILE = "session_cookies.json"
 
-async def handle_facebook_login(page: Page):
+async def handle_facebook_login(page: Page, email: str = None, password: str = None, cookies_file: str = None) -> bool:
     """
     Oturum pop-up'ını ve harici sekmedeki giriş akışını (Playwright ile) yönetir.
-    Ayrıca başarılı girişte cookieleri kaydeder, hata durumunda eski cookielere geri döner.
+    Önce çerezleri dener; çerez yoksa veya geçersizse verilen email/şifre ile giriş yapıp
+    yeni çerezleri kaydeder.
     """
-    logger.info("[AUTH] Cookie kontrolü yapılıyor...")
+    target_cookies_file = cookies_file or COOKIES_FILE
+    fb_email = email or os.getenv("FB_EMAIL") or getattr(config, "FB_EMAIL", "")
+    fb_password = password or os.getenv("FB_PASSWORD") or getattr(config, "FB_PASSWORD", "")
+
+    logger.info(f"[AUTH] Cookie kontrolü yapılıyor ({target_cookies_file})...")
     
     # 1. Kaydedilmiş cookie varsa önce onu sisteme yükle
-    if os.path.exists(COOKIES_FILE):
+    loaded_existing_cookies = False
+    if os.path.exists(target_cookies_file):
         try:
-            with open(COOKIES_FILE, "r") as f:
+            with open(target_cookies_file, "r", encoding="utf-8") as f:
                 cookies = json.load(f)
-            await page.context.add_cookies(cookies)
-            logger.info("[AUTH] Kaydedilmiş cookieler yüklendi. Durum tespiti için sayfa yenileniyor...")
-            await page.reload()
-            await asyncio.sleep(3)
+            if cookies:
+                await page.context.add_cookies(cookies)
+                loaded_existing_cookies = True
+                logger.info("[AUTH] Kaydedilmiş cookieler yüklendi. Durum tespiti için sayfa yenileniyor...")
+                await page.reload()
+                await asyncio.sleep(3)
         except Exception as e:
             logger.warning(f"[AUTH] Cookieler yüklenirken hata: {e}")
 
@@ -37,14 +46,22 @@ async def handle_facebook_login(page: Page):
         
         # Mevcut başarılı durumu da yedekleyelim
         try:
+            os.makedirs(os.path.dirname(os.path.abspath(target_cookies_file)), exist_ok=True)
             current_cookies = await page.context.cookies()
-            with open(COOKIES_FILE, "w") as f:
-                json.dump(current_cookies, f)
+            with open(target_cookies_file, "w", encoding="utf-8") as f:
+                json.dump(current_cookies, f, indent=2)
         except Exception:
             pass
-        return  # Akışı burada kes
+        return True
     except Exception:
-        logger.info("[AUTH] Sign In butonu ekranda mevcut. Login işlemi başlatılıyor...")
+        logger.info("[AUTH] Sign In butonu ekranda mevcut. Email/Şifre ile otomatik giriş başlatılıyor...")
+        if loaded_existing_cookies:
+            try:
+                await page.context.clear_cookies()
+                await page.reload()
+                await asyncio.sleep(2)
+            except Exception:
+                pass
 
     logger.info("[AUTH] Sign In akışı başlatılıyor...")
     
@@ -201,8 +218,7 @@ async def handle_facebook_login(page: Page):
                     "div[role='button']:has-text('Continue')",
                     "div[role='button']:has-text('olarak devam et')",
                     "button:has-text('Devam')",
-                    "button:has-text('Continue')",
-                    "div[aria-label*='Murathan olarak devam et']"
+                    "button:has-text('Continue')"
                 ]
                 
                 clicked_continue = False
@@ -221,17 +237,16 @@ async def handle_facebook_login(page: Page):
                             
                 if not clicked_continue:
                     # B: Devam butonu yoksa Email/Şifre formunu doldur
-                    logger.info("[AUTH] Facebook login formu dolduruluyor...")
-                    from config import FB_EMAIL, FB_PASSWORD
+                    logger.info(f"[AUTH] Facebook login formu dolduruluyor (Kullanıcı: {fb_email})...")
                     
-                    email_inputs = await new_page.locator("input[name='email'], input[placeholder*='E-posta'], input[placeholder*='email']").all()
-                    if email_inputs and FB_EMAIL:
-                        await email_inputs[0].fill(FB_EMAIL)
+                    email_inputs = await new_page.locator("input[name='email'], input[placeholder*='E-posta'], input[placeholder*='email'], input[placeholder*='Telefon']").all()
+                    if email_inputs and fb_email:
+                        await email_inputs[0].fill(fb_email)
                         await asyncio.sleep(0.5)
                         
                     pass_inputs = await new_page.locator("input[name='pass'], input[type='password']").all()
-                    if pass_inputs and FB_PASSWORD:
-                        await pass_inputs[0].fill(FB_PASSWORD)
+                    if pass_inputs and fb_password:
+                        await pass_inputs[0].fill(fb_password)
                         await asyncio.sleep(0.5)
                         try:
                             # Butonu bulamama ihtimaline karşı doğrudan Enter'a basalım
@@ -271,17 +286,26 @@ async def handle_facebook_login(page: Page):
                     
                     # 3. Şifreyle girdikten sonra Facebook, "Devam et" diyebilir. Onu da bekle.
                     logger.info("[AUTH] Şifre sonrası 'Devam Et' ekranı bekleniyor...")
-                    await asyncio.sleep(5)
-                    try:
-                        for sel in continue_selectors:
-                            after_btns = await new_page.locator(sel).all()
-                            for btn in after_btns:
-                                if await btn.is_visible():
-                                    await btn.click(force=True)
-                                    logger.info("[AUTH] Şifre girişi sonrası Facebook 'Devam Et' butonuna tıklandı.")
+                    for _ in range(15):
+                        if new_page.is_closed():
+                            break
+                        found_after = False
+                        try:
+                            for sel in continue_selectors:
+                                after_btns = await new_page.locator(sel).all()
+                                for btn in after_btns:
+                                    if await btn.is_visible():
+                                        await btn.click(force=True)
+                                        logger.info("[AUTH] Şifre girişi sonrası Facebook 'Devam Et' butonuna tıklandı.")
+                                        found_after = True
+                                        break
+                                if found_after:
                                     break
-                    except Exception as e_continue:
-                        logger.debug(f"[AUTH] Şifre sonrası devam et bulunamadı: {e_continue}")
+                        except Exception:
+                            pass
+                        if found_after:
+                            break
+                        await asyncio.sleep(1)
 
             except Exception as try_e:
                 logger.warning(f"[AUTH] Facebook form içi doldurmada hata: {try_e}")
@@ -290,9 +314,18 @@ async def handle_facebook_login(page: Page):
                 if new_page.is_closed():
                     logger.info("[AUTH] Facebook popup penceresi başarıyla kapandı. Giriş tamamlanıyor.")
                     break
+                # Kullanıcı 2FA/Onay verirse sonrasında çıkan Devam Et butonuna otomatik bas
+                try:
+                    for sel in continue_selectors:
+                        after_btns = await new_page.locator(sel).all()
+                        for btn in after_btns:
+                            if await btn.is_visible():
+                                await btn.click(force=True)
+                                logger.info("[AUTH] Onay sonrası 'Devam Et' butonuna otomatik tıklandı.")
+                                break
+                except Exception:
+                    pass
                 await asyncio.sleep(1)
-            
-
             
         except Exception as e:
             logger.error(f"[AUTH] Facebook sekmesi içindeki işlemler sırasında hata: {e}")
@@ -315,26 +348,29 @@ async def handle_facebook_login(page: Page):
                 
                 # Başarılı olunca güncel cookie'yi kaydet
                 try:
+                    os.makedirs(os.path.dirname(os.path.abspath(target_cookies_file)), exist_ok=True)
                     current_cookies = await page.context.cookies()
-                    with open(COOKIES_FILE, "w") as f:
-                        json.dump(current_cookies, f)
-                    logger.info(f"[AUTH] Yeni cookieler başarıyla '{COOKIES_FILE}' dosyasına kaydedildi.")
+                    with open(target_cookies_file, "w", encoding="utf-8") as f:
+                        json.dump(current_cookies, f, indent=2)
+                    logger.info(f"[AUTH] Yeni cookieler başarıyla '{target_cookies_file}' dosyasına kaydedildi.")
                 except Exception as e_cook:
                     logger.warning(f"[AUTH] Cookieler kaydedilirken hata oluştu: {e_cook}")
+                return True
                     
             except Exception:
                 logger.warning("[AUTH] Sign In butonu kaybolmadı. Facebook üzerinden giriş başarısız olmuş olabilir.")
-                # İstenildiği gibi başarısız durumda eski hazır cookie var ise onu geri yükle
-                if os.path.exists(COOKIES_FILE):
+                if os.path.exists(target_cookies_file):
                     logger.info("[AUTH] Giriş başarısız olduğundan hazırda olan eski cookieler zorla yükleniyor...")
                     try:
-                        with open(COOKIES_FILE, "r") as f:
+                        with open(target_cookies_file, "r", encoding="utf-8") as f:
                             old_cookies = json.load(f)
                         await page.context.add_cookies(old_cookies)
                         await page.reload()
                         logger.info("[AUTH] Eski hazır cookieler geri yüklendi.")
                     except Exception as e_rec:
                         logger.warning(f"[AUTH] Eski cookielerin geri yüklenmesinde hata: {e_rec}")
+                return False
                 
     else:
         logger.info("[AUTH] Facebook butonu bulunamadı/tıklanmadı.")
+        return False
