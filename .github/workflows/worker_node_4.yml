@@ -36,7 +36,7 @@ jobs:
 
       - name: Oturum Çerezlerini Yükle (Varsa)
         env:
-          SESSION_COOKIES: ${{ secrets.SESSION_COOKIES || secrets.BUFF_COOKIES }}
+          SESSION_COOKIES: ${{ secrets.SESSION_COOKIES_4 || secrets.SESSION_COOKIES || secrets.BUFF_COOKIES }}
         run: |
           python -c "
           import os, json
@@ -59,8 +59,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          FB_EMAIL: ${{ secrets.FB_EMAIL }}
-          FB_PASSWORD: ${{ secrets.FB_PASSWORD }}
+          FB_EMAIL: ${{ secrets.FB_EMAIL_4 || secrets.FB_EMAIL }}
+          FB_PASSWORD: ${{ secrets.FB_PASSWORD_4 || secrets.FB_PASSWORD }}
           TARGET_BASE_URL: ${{ secrets.TARGET_BASE_URL }}
           NODE_NAME: "Worker Node 4"
         run: |
