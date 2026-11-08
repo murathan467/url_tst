@@ -404,7 +404,7 @@ class DataScraper:
             # Ana sayfa (referans) fiyatını çek
             reference_price = 0.0
             try:
-                reference_price = await page.evaluate('''() => {
+                reference_price = await page.evaluate(r'''() => {
                     let rp = 0.0;
                     
                     // 1. Olasılık: Bilindik class veya ID

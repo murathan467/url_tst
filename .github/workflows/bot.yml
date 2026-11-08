@@ -36,7 +36,7 @@ jobs:
 
       - name: Oturum Çerezlerini Yükle (Varsa)
         env:
-          SESSION_COOKIES: ${{ secrets.SESSION_COOKIES }}
+          SESSION_COOKIES: ${{ secrets.SESSION_COOKIES || secrets.BUFF_COOKIES }}
         run: |
           python -c "
           import os, json
@@ -76,7 +76,7 @@ jobs:
           done
 
       - name: Süre Dolduğunda Yeni Döngüyü Otomatik Tetikle (7/24 Kesintisiz)
-        if: always()
+        if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ secrets.AUTO_RESTART_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
