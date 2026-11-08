@@ -1,0 +1,12 @@
+ChromeProfile/
+ChromeProfilePlaywright/
+__pycache__/
+*.log
+*.sqlite3
+.git/
+.venv/
+env/
+venv/
+.env
+*cookies.json
+*.html

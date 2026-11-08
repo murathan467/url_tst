@@ -1,0 +1,63 @@
+name: Cloud Task Sync Worker
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Her 6 saatte bir otomatik başlar (GitHub Actions maksimum job süresi 6 saattir)
+    - cron: '0 */6 * * *'
+
+concurrency:
+  group: sync-worker-runner
+  cancel-in-progress: false
+
+jobs:
+  run-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355 # 6 saatlik (360 dk) sert limitten hemen önce güvenli kapanış
+
+    steps:
+      - name: Repo Kodlarını Çek
+        uses: actions/checkout@v4
+
+      - name: Python 3.12 Kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Kütüphaneleri ve Tarayıcı Motorunu Kur
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Oturum Çerezlerini Yükle (Varsa)
+        env:
+          SESSION_COOKIES: ${{ secrets.SESSION_COOKIES }}
+        run: |
+          if [ -n "$SESSION_COOKIES" ]; then
+            echo "$SESSION_COOKIES" > session_cookies.json
+            echo "session_cookies.json başarıyla oluşturuldu."
+          else
+            echo "Kayıtlı oturum bulunamadı, otomatik giriş denenecek."
+          fi
+
+      - name: Senkronizasyon İşçisini Çalıştır (5 Saat 45 Dakika)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FB_EMAIL: ${{ secrets.FB_EMAIL }}
+          FB_PASSWORD: ${{ secrets.FB_PASSWORD }}
+          TARGET_BASE_URL: ${{ secrets.TARGET_BASE_URL }}
+        run: |
+          echo "Worker başlatılıyor..."
+          timeout -s SIGINT 345m python main_local.py || true
+
+      - name: Süre Dolduğunda Yeni Döngüyü Otomatik Tetikle (7/24 Kesintisiz)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Mevcut çalışma süresi tamamlandı, yeni iş (job) tetikleniyor..."
+          gh workflow run bot.yml || true

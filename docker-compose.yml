@@ -1,0 +1,48 @@
+version: '3.8'
+
+x-worker-base: &worker-base
+  build: .
+  restart: unless-stopped
+  # volumes:
+  #   - ./ChromeProfilePlaywright:/app/ChromeProfilePlaywright
+
+services:
+  worker-1:
+    <<: *worker-base
+    container_name: sync-worker-1
+    ports:
+      - "5901:5900"
+    environment:
+      - WORKER_ID=1
+      
+  worker-2:
+    <<: *worker-base
+    container_name: sync-worker-2
+    ports:
+      - "5902:5900"
+    environment:
+      - WORKER_ID=2
+
+  worker-3:
+    <<: *worker-base
+    container_name: sync-worker-3
+    ports:
+      - "5903:5900"
+    environment:
+      - WORKER_ID=3
+
+  worker-4:
+    <<: *worker-base
+    container_name: sync-worker-4
+    ports:
+      - "5904:5900"
+    environment:
+      - WORKER_ID=4
+
+  worker-5:
+    <<: *worker-base
+    container_name: sync-worker-5
+    ports:
+      - "5905:5900"
+    environment:
+      - WORKER_ID=5

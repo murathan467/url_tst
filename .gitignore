@@ -1,0 +1,15 @@
+ChromeProfilePlaywright/
+ChromeProfile/
+bot_data/
+__pycache__/
+.vscode/
+*.log
+error_log.txt
+.env
+buff_cookies.json
+session_cookies.json
+*cookies.json
+*.html
+extract_prices_test.py
+test_buff_dom.py
+test_parse_html.py
