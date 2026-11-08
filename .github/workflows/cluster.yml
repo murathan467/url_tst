@@ -83,7 +83,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: [1, 2, 3, 4, 5]
+        node: [1, 2, 3]
 
     steps:
       - name: Repo Kodlarını Çek
@@ -107,8 +107,6 @@ jobs:
           SESSION_COOKIES_1: ${{ secrets.SESSION_COOKIES_1 }}
           SESSION_COOKIES_2: ${{ secrets.SESSION_COOKIES_2 }}
           SESSION_COOKIES_3: ${{ secrets.SESSION_COOKIES_3 }}
-          SESSION_COOKIES_4: ${{ secrets.SESSION_COOKIES_4 }}
-          SESSION_COOKIES_5: ${{ secrets.SESSION_COOKIES_5 }}
         run: |
           python -c "
           import os, json
@@ -141,10 +139,6 @@ jobs:
           FB_PASSWORD_2: ${{ secrets.FB_PASSWORD_2 }}
           FB_EMAIL_3: ${{ secrets.FB_EMAIL_3 }}
           FB_PASSWORD_3: ${{ secrets.FB_PASSWORD_3 }}
-          FB_EMAIL_4: ${{ secrets.FB_EMAIL_4 }}
-          FB_PASSWORD_4: ${{ secrets.FB_PASSWORD_4 }}
-          FB_EMAIL_5: ${{ secrets.FB_EMAIL_5 }}
-          FB_PASSWORD_5: ${{ secrets.FB_PASSWORD_5 }}
           TARGET_BASE_URL: ${{ secrets.TARGET_BASE_URL }}
           NODE_NAME: "Worker Node ${{ matrix.node }}"
         run: |
