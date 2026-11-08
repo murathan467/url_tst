@@ -1,0 +1,85 @@
+name: Cloud Task Worker Node 4
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Her 3 saatte bir tetikleme (Önceki çalışıyorsa concurrency kuyruğa alır)
+    - cron: '20 */3 * * *'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-worker-node-4
+  cancel-in-progress: false
+
+jobs:
+  run-worker-node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355 # 6 saatlik sınırdan hemen önce güvenli kapanış
+
+    steps:
+      - name: Repo Kodlarını Çek
+        uses: actions/checkout@v4
+
+      - name: Python 3.12 Kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Kütüphaneleri ve Tarayıcı Motorunu Kur
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Oturum Çerezlerini Yükle (Varsa)
+        env:
+          SESSION_COOKIES: ${{ secrets.SESSION_COOKIES || secrets.BUFF_COOKIES }}
+        run: |
+          python -c "
+          import os, json
+          raw = os.environ.get('SESSION_COOKIES', '').strip()
+          if raw:
+              try:
+                  data = json.loads(raw)
+                  with open('session_cookies.json', 'w', encoding='utf-8') as f:
+                      json.dump(data, f)
+                  print('session_cookies.json başarıyla oluşturuldu.')
+              except Exception as e:
+                  print(f'Uyarı: SESSION_COOKIES JSON formatı okunamadı: {e}')
+          else:
+              print('Kayıtlı oturum bulunamadı, form girişi denenecek.')
+          "
+
+      - name: İşçi Düğümünü Çalıştır (5 Saat 45 Dakika)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FB_EMAIL: ${{ secrets.FB_EMAIL }}
+          FB_PASSWORD: ${{ secrets.FB_PASSWORD }}
+          TARGET_BASE_URL: ${{ secrets.TARGET_BASE_URL }}
+          NODE_NAME: "Worker Node 4"
+        run: |
+          echo "Worker Node 4 başlatılıyor (Sadece işçi modu, 5 worker)..."
+          end=$((SECONDS+20700))
+          while [ $SECONDS -lt $end ]; do
+            remaining=$((end-SECONDS))
+            echo "Kalan çalışma süresi: $remaining saniye..."
+            timeout -s SIGINT ${remaining}s python main_vm.py || true
+            if [ $SECONDS -lt $end ]; then
+              echo "İşlem kapandı. 5 saniye içinde otomatik yeniden başlatılıyor..."
+              sleep 5
+            fi
+          done
+
+      - name: Süre Dolduğunda Yeni Döngüyü Otomatik Tetikle (7/24 Kesintisiz)
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.AUTO_RESTART_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Mevcut süre tamamlandı, yeni döngü başlatılıyor..."
+          gh workflow run worker_node_4.yml --repo ${{ github.repository }} --ref main || true
