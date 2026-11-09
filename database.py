@@ -14,15 +14,11 @@ from supabase import create_client, Client, ClientOptions
 from config import SUPABASE_URL, SUPABASE_KEY
 import httpx
 
-# httpx seviyesinde HTTP/2'yi kapat, stale keep-alive soketlerini önle ve sıkı timeout uygula
+# httpx seviyesinde HTTP/2'yi kapat ve dengeli timeout uygula
 _original_client_init = httpx.Client.__init__
 def _patched_client_init(self, *args, **kwargs):
     kwargs['http2'] = False
-    kwargs['timeout'] = httpx.Timeout(12.0, connect=5.0, read=10.0, write=10.0, pool=5.0)
-    kwargs['limits'] = httpx.Limits(max_connections=10, max_keepalive_connections=0)
-    headers = dict(kwargs.get('headers') or {})
-    headers['Connection'] = 'close'
-    kwargs['headers'] = headers
+    kwargs['timeout'] = httpx.Timeout(25.0, connect=10.0, read=20.0, write=20.0, pool=10.0)
     _original_client_init(self, *args, **kwargs)
 httpx.Client.__init__ = _patched_client_init
 
@@ -56,7 +52,7 @@ def _create_supabase_client() -> Client:
             except Exception:
                 pass
 
-        options = ClientOptions(postgrest_client_timeout=10)
+        options = ClientOptions(postgrest_client_timeout=25)
         client = create_client(SUPABASE_URL, SUPABASE_KEY, options=options)
 
         if hasattr(client, 'postgrest') and hasattr(client.postgrest, 'client'):
@@ -135,14 +131,14 @@ def init_db():
 
 
 def _preload_notified_cache():
-    """Başlangıçta son 1000 bildirimi RAM'e çeker, tekrarlayan SELECT sorgularını önler."""
+    """Başlangıçta son 200 bildirimi RAM'e çeker, tekrarlayan SELECT sorgularını önler."""
     global _notified_cache
     try:
         res = _execute_with_retry(
             lambda client: client.table("notified_bargains")
             .select("skin_name, seller, float_value")
             .order("id", desc=True)
-            .limit(1000)
+            .limit(200)
             .execute(),
             action_name="Preload Notified Cache",
             retries=1,
@@ -227,16 +223,19 @@ def save_skins_batch(skins_list: list) -> bool:
         if not formatted_list:
             return True
 
-        # Upsert + ignore_duplicates sayesinde 1 kayıt bile zaten varsa hata vermez, kalanları yazar
-        _execute_with_retry(
-            lambda client: client.table("skins").upsert(
-                formatted_list,
-                on_conflict="skin_id",
-                ignore_duplicates=True
-            ).execute(),
-            action_name="Bulk Upsert (skins)",
-            retries=2,
-        )
+        # Küçük parçalar (25'erli) halinde upsert yaparak yükü ve timeout riskini minimuma indir
+        chunk_size = 25
+        for i in range(0, len(formatted_list), chunk_size):
+            chunk = formatted_list[i:i + chunk_size]
+            _execute_with_retry(
+                lambda client, ch=chunk: client.table("skins").upsert(
+                    ch,
+                    on_conflict="skin_id",
+                    ignore_duplicates=True
+                ).execute(),
+                action_name=f"Bulk Upsert (skins {i+1}-{i+len(chunk)})",
+                retries=1,
+            )
 
         for item in formatted_list:
             _known_skin_ids_cache.add(item["skin_id"])
@@ -383,7 +382,7 @@ def get_work_batch(limit: int) -> list:
         response = _execute_with_retry(
             lambda client: client.rpc("get_and_delete_skins", {"batch_limit": limit}).execute(),
             action_name="get_work_batch (RPC)",
-            retries=2,
+            retries=1,
         )
         data = response.data or []
         with _db_lock:

@@ -49,11 +49,6 @@ def signal_handler(sig, frame):
     global running
     print("\n🛑 Bot (Monitor) durduruluyor...")
     running = False
-    from database import clear_all_skins
-    try:
-        clear_all_skins()
-    except Exception:
-        pass
     os._exit(0)
 
 async def monitor_task(scraper: DataScraper):
@@ -124,7 +119,6 @@ async def main_async():
     
     try:
         init_db()
-        clear_all_skins()  # Başlangıçta veritabanını temizle
     except Exception as e:
         logger.critical(f"Veritabanı başlatılamadı: {e}")
         sys.exit(1)
@@ -171,7 +165,6 @@ async def main_async():
     finally:
         logger.info("Tarayıcı ve bağlam kapatılıyor...")
         await scraper.close_browser()
-        clear_all_skins()  # Kapanışta DB temizle
         logger.info("Monitor Bot başarıyla kapatıldı. 👋")
 
 
