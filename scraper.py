@@ -40,35 +40,29 @@ class DataScraper:
         # Global cooldown: Toast rate limit yakalandığında TÜM worker'lar bu zamana kadar bekler
         self.global_cooldown_until = 0.0
 
-    async def wait_for_rate_limit(self, action_name: str = "Aksiyon"):
-        """Tüm botların ortaklaşa kullandığı global limit kontrolü."""
-        # Önce global cooldown kontrolü (toast rate limit sonrası)
-        now = time.time()
-        if self.global_cooldown_until > now:
-            wait_time = self.global_cooldown_until - now
-            logger.warning(f"[Global Cooldown] 🛑 Rate limit cooldown aktif! '{action_name}' {wait_time:.1f} sn bekleyecek...")
-            await asyncio.sleep(wait_time)
-        
-        # Sabit sürelere karşı WAF yakalanmasını önlemek için rastgelelik
-        limit_min = getattr(config, "GLOBAL_RATE_LIMIT_MIN", 1.0)
-        limit_max = getattr(config, "GLOBAL_RATE_LIMIT_MAX", 3.0)
-        
+   async def wait_for_rate_limit(self, action_name: str = "Aksiyon"):
+        """Tüm botların ortaklaşa kullandığı global limit kontrolü (Kilit içi Cooldown korumalı)."""
+        limit_min = getattr(config, "GLOBAL_RATE_LIMIT_MIN", 3.8)
+        limit_max = getattr(config, "GLOBAL_RATE_LIMIT_MAX", 5.8)
         delay = random.uniform(limit_min, limit_max)
         
         async with self.action_lock:
+            # 1. Cooldown kontrolünü KİLİT İÇİNDE yap (Böylece sıradaki worker'lar da anında durur)
             now = time.time()
-            if self.last_action_time > now:
-                wait_time = self.last_action_time - now
-                logger.warning(f"[Global Rate Limit] 🛑 Global duraklatma aktif! '{action_name}' islemi {wait_time:.1f} sn ertelendi.")
+            if self.global_cooldown_until > now:
+                wait_time = self.global_cooldown_until - now
+                logger.warning(f"[Global Cooldown] 🛑 Rate limit cooldown aktif! '{action_name}' {wait_time:.1f} sn bekleyecek...")
                 await asyncio.sleep(wait_time)
-                self.last_action_time = time.time()
-            else:
-                elapsed = now - self.last_action_time
-                if elapsed < delay:
-                    wait_time = delay - elapsed
-                    logger.info(f"[Global Rate Limit] ⏳ Baska bir bot islem yapti. '{action_name}' icin {wait_time:.1f} sn bekleniyor...")
-                    await asyncio.sleep(wait_time)
-                self.last_action_time = time.time()
+                now = time.time()
+
+            # 2. Normal Rate Limit kontrolü
+            elapsed = now - self.last_action_time
+            if elapsed < delay:
+                wait_time = delay - elapsed
+                logger.info(f"[Global Rate Limit] ⏳ Baska bir bot islem yapti. '{action_name}' icin {wait_time:.1f} sn bekleniyor...")
+                await asyncio.sleep(wait_time)
+                
+            self.last_action_time = time.time()
 
     async def check_and_handle_toast(self, page: Page):
         """Ekranda hata toast mesajı var mı diye hızlıca bakar, varsa TÜM worker'ları global olarak durdurur."""
