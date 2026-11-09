@@ -194,7 +194,13 @@ class DataScraper:
         try:
             logger.info(f"Ana liste sayfasına gidiliyor: {config.TARGET_LIST_URL}")
             await self.wait_for_rate_limit("Ana sayfa taranıyor")
-            await page.goto(config.TARGET_LIST_URL, timeout=config.PAGE_LOAD_TIMEOUT * 1000)
+            
+            # Monitor ana sayfa için de güvenli DOM koruması
+            await asyncio.wait_for(
+                page.goto(config.TARGET_LIST_URL, timeout=config.PAGE_LOAD_TIMEOUT * 1000, wait_until="domcontentloaded"),
+                timeout=config.PAGE_LOAD_TIMEOUT + 5
+            )
+            
             await self.check_and_handle_toast(page)
             await asyncio.sleep(random.uniform(2, 4))
 
@@ -356,7 +362,13 @@ class DataScraper:
             for attempt in range(2):
                 try:
                     await self.wait_for_rate_limit(f"Detay sayfası yükleniyor: {skin_name}")
-                    await page.goto(skin_url, timeout=config.PAGE_LOAD_TIMEOUT * 1000)
+                    
+                    # Güvenli ve zaman aşımı korumalı sayfa yükleme
+                    await asyncio.wait_for(
+                        page.goto(skin_url, timeout=config.PAGE_LOAD_TIMEOUT * 1000, wait_until="domcontentloaded"),
+                        timeout=config.PAGE_LOAD_TIMEOUT + 5
+                    )
+                    
                     await self.check_and_handle_toast(page)
                     page_loaded = True
                     break
@@ -364,7 +376,7 @@ class DataScraper:
                     if attempt == 0:
                         logger.warning(f"[Worker] '{skin_name}' sayfa yükleme timeout, tekrar deneniyor...")
                         try:
-                            await page.reload(timeout=config.PAGE_LOAD_TIMEOUT * 1000)
+                            await page.reload(timeout=config.PAGE_LOAD_TIMEOUT * 1000, wait_until="domcontentloaded")
                             await self.check_and_handle_toast(page)
                             page_loaded = True
                             break
