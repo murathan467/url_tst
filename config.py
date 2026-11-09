@@ -61,8 +61,8 @@ TARGET_LIST_URL = os.getenv(
 MAX_BARGAIN_PRICE_DIFFERENCE_PERCENT = 12.5
 
 # Global kritik işlemler arası beklenecek rastgele sürenin sınırları (saniye)
-GLOBAL_RATE_LIMIT_MIN = 3
-GLOBAL_RATE_LIMIT_MAX = 5
+GLOBAL_RATE_LIMIT_MIN = 3.8  # Eskisi: 3
+GLOBAL_RATE_LIMIT_MAX = 5.8  # Eskisi: 5
 
 # Detay sayfasında incelenecek maksimum kayıt sayısı
 MAX_LISTINGS_TO_CHECK = 5
@@ -85,8 +85,8 @@ BLOCK_CSS = False
 # ========================
 MAX_WORKERS = 5 
 BATCH_SIZE = 1 
-SCAN_INTERVAL_MIN = 3.5
-SCAN_INTERVAL_MAX = 5 
+SCAN_INTERVAL_MIN = 4.5      # Eskisi: 3.5 (Monitor'ün ana sayfayı tarama sıklığı)
+SCAN_INTERVAL_MAX = 6.5      # Eskisi: 5
 
 # ========================
 # Tarayıcı Ayarları
