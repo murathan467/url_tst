@@ -42,15 +42,20 @@ def signal_handler(sig, frame):
     os._exit(0)
 
 async def dispatcher_task(queue: asyncio.Queue):
-    """Sadece sıradaki işleri Supabase üzerinden çeker"""
-    logger.info("[Dispatcher] Supabase kuyruk çekicisi başlatıldı.")
-    fetch_interval = 2.0
+    """Sıradaki işleri Supabase üzerinden akıllı aralıklarla (Adaptive Backoff) çeker."""
+    logger.info("[Dispatcher] Supabase kuyruk çekicisi başlatıldı (IO Optimize).")
+    
+    # Kuyrukta iş varken hızlı, iş yokken yavaşlayan bekleme süresi
+    fetch_interval = 3.0
+    # Her RPC çağrısında tek tek değil, en az 3 ürün çekerek DB yükünü 3 kat azalt
+    pull_limit = max(BATCH_SIZE, 3)
     
     while running:
-        if queue.qsize() < 1: 
+        if queue.qsize() < 2: 
             try:
-                batch = get_work_batch(BATCH_SIZE)
+                batch = get_work_batch(pull_limit)
                 if batch:
+                    fetch_interval = 3.0  # İş bulundu, aktif moda geç
                     logger.info(f"[Dispatcher] Veritabanından {len(batch)} adet ürün işlenmek üzere çekildi.")
                     for s in batch:
                         await queue.put([{
@@ -59,8 +64,12 @@ async def dispatcher_task(queue: asyncio.Queue):
                             "wear_value": s.get("wear_value", ""),
                             "url": f"{TARGET_BASE_URL}/market/goods/{s['skin_id']}?game=csgo"
                         }])
+                else:
+                    # Kuyruk boşsa bekleme süresini kademeli olarak 10 saniyeye kadar çıkar (Disk IO Koruması)
+                    fetch_interval = min(fetch_interval + 2.0, 10.0)
             except Exception as e:
                 logger.error(f"[Dispatcher] İş çekme hatası: {e}")
+                fetch_interval = 8.0
                 
         iterations = int(fetch_interval * 10)
         for _ in range(iterations):
@@ -124,8 +133,6 @@ async def worker_task(worker_id: str, scraper: DataScraper, queue: asyncio.Queue
                          total_bargains += 1
                          
                  except Exception as e:
-                     # Eğer WAF engeli veya Proxy hatası yendiyse exception'ı yukarı fırlat,
-                     # böylece proxy loop yakalayabilir ve değiştirebilir.
                      if "WAF Engeli" in str(e) or "Timeout" in str(e) or "net::ERR_" in str(e):
                          raise e
                      logger.error(f"[Worker-{worker_id}] Skin işleme hatası ({skin['name']}): {e}")
@@ -133,7 +140,6 @@ async def worker_task(worker_id: str, scraper: DataScraper, queue: asyncio.Queue
              logger.info(f"[Worker-{worker_id}] Paket tamamlandı. Toplam {total_bargains} bargain bildirildi.")
                      
         except Exception as e:
-             # Hatayı fırlatarak while döngüsünden çıkılmasını ve proxy loop'a geçilmesini sağla.
              logger.error(f"[Worker-{worker_id}] Kritik Hata (Proxy veya WAF): {e}")
              if worker_page and not worker_page.is_closed():
                  try:
@@ -141,7 +147,7 @@ async def worker_task(worker_id: str, scraper: DataScraper, queue: asyncio.Queue
                  except Exception:
                      pass
              queue.task_done()
-             raise e # Dışarıdaki proxy loop'a gönder
+             raise e
         finally:
              if worker_page and not worker_page.is_closed():
                  try:
@@ -167,7 +173,6 @@ async def main_async():
         sys.exit(1)
         
     queue = asyncio.Queue()
-    # Dispatcher'ı bir kere başlat
     asyncio.create_task(dispatcher_task(queue))
 
     proxies = get_free_proxies()
@@ -215,7 +220,6 @@ async def main_async():
         finally:
             logger.info("[ProxyLoop] Tarayıcı ve bağlam kapatılıyor...")
             await scraper.close_browser()
-            # Yeni rotasyona geçmeden önce kısa bir delay
             await asyncio.sleep(2)
 
 

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud Task Sync — Veritabanı Modülü (Supabase)
-Supabase bulut veritabanı işlemleri: kayıt, kontrol, toplu iş çekme.
+Optimize Edilmiş Versiyon: RAM Cache, Upsert Ignore Duplicates ve Sıfıra Yakın Disk IO.
 """
 
 import logging
@@ -24,17 +24,24 @@ logger = logging.getLogger(__name__)
 
 supabase: Client = None
 
-# Çözüm 2 için Semaphore: Aynı anda en fazla 5 veritabanı isteğine izin ver
+# Eşzamanlı (Concurrent) İstekleri Sınırlandırmak için Semaphore
 db_semaphore = asyncio.Semaphore(5)
+
+# ==========================================================
+# DİSK IO OPTİMİZASYONU: BELLEK İÇİ ÖNBELLEKLER (RAM CACHE)
+# ==========================================================
+_notified_cache = set()          # (skin_name, seller, float_value)
+_known_skin_ids_cache = set()    # Bilinen skin_id'ler
+_skin_ids_cache_loaded = False
+_last_scanned_id_cache = None    # Son taranan skin_id
+_skin_insert_buffer = []         # Tekli save_skin çağrıları için tampon
 
 def init_db():
     global supabase
     try:
-        # Çözüm 3: Supabase İstemcisinde HTTP/2'yi Kapatmak (Geçici Alternatif)
         options = ClientOptions(postgrest_client_timeout=60)
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY, options=options)
         
-        # Httpx istemcisinde http2'yi kapatmak
         if hasattr(supabase, 'postgrest') and hasattr(supabase.postgrest, 'client'):
             try:
                 supabase.postgrest.client._http2 = False
@@ -42,39 +49,62 @@ def init_db():
                 pass
                 
         logger.info("Supabase bağlantısı başarıyla başlatıldı.")
+        _preload_notified_cache()
     except Exception as e:
         logger.error(f"Supabase başlatma hatası: {e}")
         raise
 
+def _preload_notified_cache():
+    """Başlangıçta son 1000 bildirimi RAM'e çeker, tekrarlayan SELECT sorgularını önler."""
+    global _notified_cache
+    try:
+        res = supabase.table("notified_bargains").select("skin_name, seller, float_value").order("id", desc=True).limit(1000).execute()
+        if res.data:
+            for row in res.data:
+                key = (row.get("skin_name", ""), row.get("seller", ""), row.get("float_value", ""))
+                _notified_cache.add(key)
+            logger.info(f"[RAM Cache] {len(_notified_cache)} adet geçmiş bildirim önbelleğe yüklendi.")
+    except Exception as e:
+        logger.debug(f"Önbellek yükleme uyarısı: {e}")
+
 def is_skin_exists(skin_id: str) -> bool:
+    if skin_id in _known_skin_ids_cache:
+        return True
     try:
         if not supabase: init_db()
         response = supabase.table("skins").select("id").eq("skin_id", skin_id).limit(1).execute()
-        return len(response.data) > 0
+        exists = len(response.data) > 0
+        if exists:
+            _known_skin_ids_cache.add(skin_id)
+        return exists
     except Exception as e:
         logger.error(f"Skin kontrolü hatası (skin_id={skin_id}): {e}")
         return False
 
 def save_skin(skin_id: str, skin_name: str = "", wear_value: str = ""):
-    try:
-        if not supabase: init_db()
-        supabase.table("skins").insert({
-            "skin_id": skin_id,
-            "skin_name": skin_name,
-            "wear_value": wear_value,
-            "processed_at": datetime.utcnow().isoformat()
-        }).execute()
-        wear_info = f" ({wear_value})" if wear_value else ""
-        logger.info(f"Skin buluta eklendi: {skin_name}{wear_info} (ID: {skin_id})")
-    except Exception as e:
-        # Tekrarlayan anahtar hatalarını (duplicate key) yoksay
-        if "duplicate key value" not in str(e).lower() and "violates unique constraint" not in str(e).lower():
-            logger.error(f"Skin kaydetme hatası (skin_id={skin_id}): {e}")
+    """Tekli çağrıları tamponda biriktirip 20'şerli toplu yazar."""
+    if skin_id in _known_skin_ids_cache:
+        return
+    _skin_insert_buffer.append({
+        "skin_id": skin_id,
+        "skin_name": skin_name,
+        "wear_value": wear_value
+    })
+    if len(_skin_insert_buffer) >= 20:
+        flush_skin_buffer()
+
+def flush_skin_buffer():
+    global _skin_insert_buffer
+    if not _skin_insert_buffer:
+        return
+    to_save = _skin_insert_buffer[:]
+    _skin_insert_buffer.clear()
+    save_skins_batch(to_save)
 
 def save_skins_batch(skins_list: list):
     """
-    Çözüm 1: Toplu Ekleme (Bulk Insert) - En Kesin Çözüm
-    Veritabanına veri yazarken bunları tek tek değil, bir liste halinde tek seferde gönderir.
+    Toplu Ekleme (Bulk Upsert) - Çakışan (Duplicate) kayıtları sessizce yoksayar,
+    sadece yeni olanları tek bir HTTP isteği ve tek bir Disk IO işlemiyle yazar.
     """
     try:
         if not skins_list:
@@ -83,51 +113,57 @@ def save_skins_batch(skins_list: list):
         
         now_str = datetime.utcnow().isoformat()
         formatted_list = []
+        seen_in_batch = set()
+        
         for skin in skins_list:
-            formatted_skin = skin.copy()
-            if "processed_at" not in formatted_skin:
-                formatted_skin["processed_at"] = now_str
+            s_id = skin.get("skin_id")
+            if not s_id or s_id in _known_skin_ids_cache or s_id in seen_in_batch:
+                continue
+            seen_in_batch.add(s_id)
+            
+            formatted_skin = {
+                "skin_id": s_id,
+                "skin_name": skin.get("skin_name", ""),
+                "wear_value": skin.get("wear_value", ""),
+                "processed_at": skin.get("processed_at", now_str)
+            }
             formatted_list.append(formatted_skin)
             
-        response = supabase.table("skins").insert(formatted_list).execute()
-        logger.info(f"{len(formatted_list)} adet skin toplu olarak (Bulk Insert) eklendi.")
+        if not formatted_list:
+            return
+
+        # Upsert + ignore_duplicates sayesinde 1 kayıt bile zaten varsa hata vermez, kalanları yazar
+        response = supabase.table("skins").upsert(
+            formatted_list, 
+            on_conflict="skin_id", 
+            ignore_duplicates=True
+        ).execute()
+        
+        for item in formatted_list:
+            _known_skin_ids_cache.add(item["skin_id"])
+            
+        logger.info(f"{len(formatted_list)} adet yeni skin toplu olarak (Bulk Upsert) buluta eklendi.")
         return response
     except Exception as e:
-        logger.error(f"Toplu skin kaydetme hatası (Bulk Insert): {e}")
+        logger.error(f"Toplu skin kaydetme hatası (Bulk Upsert): {e}")
 
 async def save_skin_async(skin: dict):
-    """
-    Çözüm 2: Eşzamanlı (Concurrent) İstekleri Sınırlandırmak
-    Aynı anda en fazla 5 veritabanı isteğine izin ver
-    """
     async with db_semaphore:
-        try:
-            if not supabase: init_db()
-            now_str = datetime.utcnow().isoformat()
-            skin_copy = skin.copy()
-            if "processed_at" not in skin_copy:
-                skin_copy["processed_at"] = now_str
-            response = supabase.table("skins").insert(skin_copy).execute()
-            logger.info(f"Skin async olarak eklendi: {skin_copy.get('skin_id')}")
-            return response
-        except Exception as e:
-            logger.error(f"Async skin kaydetme hatası: {e}")
+        save_skins_batch([skin])
 
 def delete_skin(skin_id: str):
-    """
-    Kuyrukta olan ürünler get_and_delete_skins SQL fonksiyonu ile Supabase
-    tarafından çekildiği anda otomatik olarak silinir.
-    O yüzden artık DB'den işlem sonunda bu fonksiyona iş düşmüyor.
-    """
-    pass
+    _known_skin_ids_cache.discard(skin_id)
 
 def delete_skins_batch(skin_ids: list):
-    """
-    Artık kullanılmıyor. Otomatik silme işlemi RPC ile sağlanıyor.
-    """
-    pass
+    for s_id in skin_ids:
+        _known_skin_ids_cache.discard(s_id)
 
 def clear_all_skins():
+    global _known_skin_ids_cache, _skin_ids_cache_loaded, _last_scanned_id_cache
+    _known_skin_ids_cache.clear()
+    _skin_ids_cache_loaded = True
+    _last_scanned_id_cache = ""
+    
     try:
         if not supabase: init_db()
         supabase.table("skins").delete().neq("id", -1).execute()
@@ -139,82 +175,112 @@ def clear_all_skins():
         if not supabase: init_db()
         supabase.table("system_state").delete().in_("key_name", ["last_scanned_id", "last_scanned_name"]).execute()
         logger.info("Son taranan ürün hafızası temizlendi.")
-    except Exception as e:
+    except Exception:
         pass
 
 def get_last_scanned_id() -> str:
+    """Önce RAM'e bakar. Sadece başlangıçta 1 kere Supabase'e sorar."""
+    global _last_scanned_id_cache
+    if _last_scanned_id_cache is not None:
+        return _last_scanned_id_cache
+        
     try:
         if not supabase: init_db()
         response = supabase.table("system_state").select("key_value").eq("key_name", "last_scanned_id").limit(1).execute()
         if response.data:
-            return response.data[0]["key_value"]
-        return ""
-    except Exception as e:
+            _last_scanned_id_cache = response.data[0]["key_value"]
+        else:
+            _last_scanned_id_cache = ""
+        return _last_scanned_id_cache
+    except Exception:
         return ""
 
 def set_last_scanned_id(skin_id: str, skin_name: str = ""):
+    """Eğer ID değişmediyse veritabanına hiç yazmaz."""
+    global _last_scanned_id_cache
+    if not skin_id or skin_id == _last_scanned_id_cache:
+        return
+        
+    _last_scanned_id_cache = skin_id
     try:
         if not supabase: init_db()
         now_str = datetime.utcnow().isoformat()
         
-        updates = []
-        updates.append({"key_name": "last_scanned_id", "key_value": skin_id, "updated_at": now_str})
+        updates = [
+            {"key_name": "last_scanned_id", "key_value": skin_id, "updated_at": now_str}
+        ]
         if skin_name:
             updates.append({"key_name": "last_scanned_name", "key_value": skin_name, "updated_at": now_str})
             
-        # Tek seferde upsert atıyoruz (tabloda key_name unique ise çalışır, daha hızlıdır)
-        # Eğer unique constraint yoksa mevcut kod gibi ayrı ayrı da atılabilir.
-        try:
-            supabase.table("system_state").upsert(updates, on_conflict="key_name").execute()
-            logger.info(f"Son okunan eşya güncellendi: {skin_name} (ID: {skin_id})")
-        except Exception:
-            # Fallback (Eğer on_conflict desteklenmiyorsa veya constraint ismi farklıysa)
-            for item in updates:
-                res = supabase.table("system_state").select("id").eq("key_name", item["key_name"]).execute()
-                if len(res.data) > 0:
-                    supabase.table("system_state").update(item).eq("key_name", item["key_name"]).execute()
-                else:
-                    supabase.table("system_state").insert(item).execute()
-            logger.info(f"Son okunan eşya güncellendi: {skin_name} (ID: {skin_id})")
-            
+        supabase.table("system_state").upsert(updates, on_conflict="key_name").execute()
+        logger.info(f"Son okunan eşya güncellendi: {skin_name} (ID: {skin_id})")
     except Exception as e:
-        logger.error(f"Son taranan eşya güncelleme hatası: {e}")
+        logger.debug(f"Son taranan eşya güncelleme uyarısı (RAM üzerinden devam ediliyor): {e}")
 
 def get_all_skin_ids() -> set:
+    """Her 4 saniyede bir tüm tabloyu okumak yerine RAM'deki kümeden yanıt verir."""
+    global _known_skin_ids_cache, _skin_ids_cache_loaded
+    if _skin_ids_cache_loaded:
+        # Bellek şişmesini önlemek için 5000'i geçerse sıfırla
+        if len(_known_skin_ids_cache) > 5000:
+            _known_skin_ids_cache.clear()
+        return _known_skin_ids_cache.copy()
+        
     try:
         if not supabase: init_db()
-        # Supabase'den çekebildiğin kadar skinID al (1000 satır sınırı olabilir, o yüzden sadece bekleyenleri tuttuğumuz için sorun yok)
         response = supabase.table("skins").select("skin_id").execute()
-        ids = {row["skin_id"] for row in response.data}
-        return ids
+        _known_skin_ids_cache = {row["skin_id"] for row in response.data}
+        _skin_ids_cache_loaded = True
+        return _known_skin_ids_cache.copy()
     except Exception as e:
         logger.error(f"Skin ID'lerini çekme hatası: {e}")
         return set()
 
 def get_work_batch(limit: int) -> list:
     """
-    Supabase'den en fazla 'limit' kadar ürünü alır ve atomik işlem olarak çeker çekmez veritabanından siler.
-    Böylece yerel bilgisayar ile VM'in aynı ürünü işleme şansı kalmaz.
+    Supabase'den en fazla 'limit' kadar ürünü alır ve atomik olarak siler.
     """
     try:
         if not supabase: init_db()
         response = supabase.rpc("get_and_delete_skins", {"batch_limit": limit}).execute()
-        # Supabase, RPC sonucunu data içerisinde dict dizisi olarak döner
-        return response.data
+        data = response.data or []
+        for row in data:
+            _known_skin_ids_cache.discard(row.get("skin_id"))
+        return data
     except Exception as e:
         logger.error(f"Supabase toplu iş çekme hatası: {e}")
         return []
 
 def is_bargain_notified(skin_name: str, seller: str, float_value: str = "") -> bool:
+    key = (skin_name, seller, float_value)
+    if key in _notified_cache:
+        return True
+        
     try:
         if not supabase: init_db()
-        response = supabase.table("notified_bargains").select("id").eq("skin_name", skin_name).eq("seller", seller).eq("float_value", float_value).limit(1).execute()
-        return len(response.data) > 0
+        response = (
+            supabase.table("notified_bargains")
+            .select("id")
+            .eq("skin_name", skin_name)
+            .eq("seller", seller)
+            .eq("float_value", float_value)
+            .limit(1)
+            .execute()
+        )
+        exists = len(response.data) > 0
+        if exists:
+            _notified_cache.add(key)
+        return exists
     except Exception as e:
         logger.error(f"Bargain bildirim kontrolü hatası: {e}")
         return False
 
 def mark_bargain_notified(skin_name: str, seller: str, float_value: str = ""):
+    key = (skin_name, seller, float_value)
+    if key in _notified_cache:
+        return
+    _notified_cache.add(key)
+    
     try:
         if not supabase: init_db()
         supabase.table("notified_bargains").insert({
@@ -223,22 +289,14 @@ def mark_bargain_notified(skin_name: str, seller: str, float_value: str = ""):
             "float_value": float_value,
             "notified_at": datetime.utcnow().isoformat()
         }).execute()
-        logger.debug(f"Bargain DB'ye kaydedildi (Tekrar bildirim gitmeyecek): {skin_name} - Satıcı: {seller} - Float: {float_value}")
+        logger.debug(f"Bargain DB'ye kaydedildi: {skin_name} - Satıcı: {seller} - Float: {float_value}")
     except Exception as e:
         if "duplicate key value" not in str(e).lower() and "violates unique constraint" not in str(e).lower():
             logger.error(f"Bargain kaydetme hatası: {e}")
 
 def log_skipped_bargain(skin_name: str, seller: str, float_value: str = ""):
-    """Aynı floatta olan ürünler bildirilmeden atlandığında yeni DB tablosuna ekler."""
-    try:
-        if not supabase: init_db()
-        supabase.table("skipped_bargains").insert({
-            "skin_name": skin_name,
-            "seller": seller,
-            "float_value": float_value,
-            "skipped_at": datetime.utcnow().isoformat()
-        }).execute()
-        logger.debug(f"Atlanan skin DB'ye kaydedildi: {skin_name} - Satıcı: {seller} - Float: {float_value}")
-    except Exception as e:
-        if "duplicate key value" not in str(e).lower() and "violates unique constraint" not in str(e).lower():
-            logger.error(f"Atlanan skin kaydetme hatası: {e}")
+    """
+    DİSK IO KORUMASI: Atlanan her ürünü veritabanına INSERT etmek Disk IO bütçesini
+    tükettiği için artık sadece konsola/log dosyasına yazıyoruz.
+    """
+    logger.debug(f"[Atlandı - DB Yazılmadı] {skin_name} - Satıcı: {seller} - Float: {float_value}")
