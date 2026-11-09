@@ -26,7 +26,8 @@ except ImportError as e:
         STEALTH_PROXY_AVAILABLE = 'LEGACY'
     except ImportError as e2:
         STEALTH_PROXY_AVAILABLE = False
-        logger.warning(f"playwright-stealth yüklenemedi! Bot algılanma ihtimali çok yüksek. Lütfen 'python -m pip install playwright-stealth' komutunu çalıştırın.")
+        logger.warning("playwright-stealth yüklenemedi! Bot algılanma ihtimali çok yüksek. Lütfen 'python -m pip install playwright-stealth' komutunu çalıştırın.")
+
 
 class DataScraper:
     """Hedef servis üzerinde kayıt tarayan asenkron scraper sınıfı."""
@@ -40,12 +41,12 @@ class DataScraper:
         # Global cooldown: Toast rate limit yakalandığında TÜM worker'lar bu zamana kadar bekler
         self.global_cooldown_until = 0.0
 
-   async def wait_for_rate_limit(self, action_name: str = "Aksiyon"):
+    async def wait_for_rate_limit(self, action_name: str = "Aksiyon"):
         """Tüm botların ortaklaşa kullandığı global limit kontrolü (Kilit içi Cooldown korumalı)."""
         limit_min = getattr(config, "GLOBAL_RATE_LIMIT_MIN", 3.8)
         limit_max = getattr(config, "GLOBAL_RATE_LIMIT_MAX", 5.8)
         delay = random.uniform(limit_min, limit_max)
-        
+
         async with self.action_lock:
             # 1. Cooldown kontrolünü KİLİT İÇİNDE yap (Böylece sıradaki worker'lar da anında durur)
             now = time.time()
@@ -61,7 +62,7 @@ class DataScraper:
                 wait_time = delay - elapsed
                 logger.info(f"[Global Rate Limit] ⏳ Baska bir bot islem yapti. '{action_name}' icin {wait_time:.1f} sn bekleniyor...")
                 await asyncio.sleep(wait_time)
-                
+
             self.last_action_time = time.time()
 
     async def check_and_handle_toast(self, page: Page):
@@ -83,10 +84,10 @@ class DataScraper:
         """Playwright chromium asenkron olarak ayağa kalkar ve bir kalıcı Context başlatır/döndürür."""
         try:
             self.playwright = await async_playwright().start()
-            
+
             profile_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ChromeProfilePlaywright")
             os.makedirs(profile_dir, exist_ok=True)
-            
+
             args = [
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -95,7 +96,7 @@ class DataScraper:
                 "--disable-popup-blocking",
                 "--lang=en-US"
             ]
-            
+
             context_args = {
                 "user_data_dir": profile_dir,
                 "headless": config.HEADLESS,
@@ -108,14 +109,14 @@ class DataScraper:
                 logger.info(f"Proxy atanıyor: {proxy_url}")
 
             self.context = await self.playwright.chromium.launch_persistent_context(**context_args)
-            
+
             # Kaynak engelleme (Resim, Medya, Font ve OPSIYONEL OLARAK CSS)
             block_types = []
             if getattr(config, "BLOCK_MEDIA", True):
                 block_types.extend(["image", "media", "font"])
             if getattr(config, "BLOCK_CSS", False):
                 block_types.append("stylesheet")
-                
+
             if block_types:
                 async def block_resources(route):
                     if route.request.resource_type in block_types:
@@ -124,8 +125,8 @@ class DataScraper:
                         await route.continue_()
                 await self.context.route("**/*", block_resources)
                 logger.info(f"Performans optimizasyonu aktif. Engellenen tipler: {', '.join(block_types)}")
-            
-            if STEALTH_PROXY_AVAILABLE == True:
+
+            if STEALTH_PROXY_AVAILABLE is True:
                 try:
                     await Stealth().apply_stealth_async(self.context)
                     logger.info("Playwright Stealth kalkanı tüm sekmelere uygulandı.")
@@ -133,10 +134,10 @@ class DataScraper:
                     logger.warning(f"Stealth kalkanı başlatılırken hata: {e}")
             elif STEALTH_PROXY_AVAILABLE == 'LEGACY':
                 logger.warning("Eski sürüm playwright-stealth algılandı. Lütfen pip ile güncelleyin.")
-            
+
             logger.info("Playwright tarayıcısı başarıyla başlatıldı.")
             return self.context
-            
+
         except Exception as e:
             logger.error(f"Tarayıcı başlatma hatası: {e}")
             raise
@@ -196,7 +197,7 @@ class DataScraper:
             await page.goto(config.TARGET_LIST_URL, timeout=config.PAGE_LOAD_TIMEOUT * 1000)
             await self.check_and_handle_toast(page)
             await asyncio.sleep(random.uniform(2, 4))
-            
+
             await self._cleanup_popups(page)
             await self._scroll_slowly(page)
             await asyncio.sleep(1)
@@ -205,18 +206,19 @@ class DataScraper:
             item_links = await page.locator("a[href*='/market/goods/']").all()
             if not item_links:
                 logger.warning("Hiçbir skin kartı bulunamadı.")
-                return skins
-                
+                return skins, first_item_id, first_item_name
+
             seen_ids = set()
             for item in item_links:
                 try:
                     href = await item.get_attribute("href")
-                    if not href: continue
-                    
+                    if not href:
+                        continue
+
                     skin_id = self._extract_goods_id(href)
                     if not skin_id or skin_id in seen_ids:
                         continue
-                        
+
                     name = ""
                     # H3 etiketini içinden bulmayı dene
                     h3s = await item.locator("h3").all()
@@ -224,21 +226,22 @@ class DataScraper:
                         name = await h3s[0].get_attribute("title")
                         if not name:
                             name = await h3s[0].inner_text()
-                    
+
                     if not name:
-                         name = await item.inner_text()
-                    
+                        name = await item.inner_text()
+
                     name = name.strip()
-                    if not name: name = f"Skin_{skin_id}"
+                    if not name:
+                        name = f"Skin_{skin_id}"
 
                     if skin_id == last_scanned_id:
                         logger.info(f"⏭ Daha önce taranan limite gelindi (ID: {skin_id} - İsim: {name}). Sayfanın kalanı atlanıyor.")
                         break
-                        
+
                     if not first_item_id:
                         first_item_id = skin_id
                         first_item_name = name
-                    
+
                     # config içerisindeki yasaklı kelimeleri kontrol et
                     skip_item = False
                     for keyword in getattr(config, "BLOCKED_ITEM_KEYWORDS", ["sticker"]):
@@ -247,14 +250,14 @@ class DataScraper:
                             break
                     if skip_item:
                         continue
-                    
+
                     wear_value = ""
                     try:
                         full_text = await item.inner_text()
                         full_text_lower = full_text.lower()
                         name_lower = name.lower()
                         words = full_text.split()
-                        
+
                         if "factory new" in full_text_lower or "factory new" in name_lower or "FN" in words:
                             wear_value = "FN"
                         elif "minimal wear" in full_text_lower or "minimal wear" in name_lower or "MW" in words:
@@ -269,7 +272,7 @@ class DataScraper:
                             wear_value = "Vanilla"
                     except Exception:
                         pass
-                    
+
                     seen_ids.add(skin_id)
                     skins.append({
                         "id": skin_id,
@@ -277,16 +280,16 @@ class DataScraper:
                         "url": href if href.startswith("http") else f"{config.TARGET_BASE_URL}{href}",
                         "wear_value": wear_value
                     })
-                except Exception as e:
+                except Exception:
                     pass
-            
+
             logger.info(f"Ana listeden {len(skins)} adet benzersiz yeni skin çekildi.")
-            
+
         except PlaywrightTimeoutError:
             logger.error("Ana sayfa yüklenirken zaman aşımı yaşandı.")
         except Exception as e:
             logger.error(f"fetch_skin_list hatası: {e}")
-            
+
         return skins, first_item_id, first_item_name
 
     async def _set_sort_to_newest(self, page: Page):
@@ -294,17 +297,17 @@ class DataScraper:
         try:
             # Önce popup'ları kapat
             await self._cleanup_popups(page)
-            
+
             # Dropdown trigger: .select-quality (sıralama butonu)
             dropdown = page.locator(".select-quality")
-            
+
             # Dropdown görünür mü kontrol et
             try:
                 await dropdown.wait_for(state="visible", timeout=5000)
             except PlaywrightTimeoutError:
                 logger.debug("Sıralama dropdown'ı bulunamadı, atlanıyor.")
                 return False
-            
+
             # Zaten "New" seçili mi kontrol et
             try:
                 current_text = await dropdown.inner_text()
@@ -313,11 +316,11 @@ class DataScraper:
                     return True
             except Exception:
                 pass
-            
+
             # Dropdown'ı aç
             await dropdown.click(force=True)
             await asyncio.sleep(1.0)
-            
+
             # Playwright native locator ile "New" seçeneğini bul ve tıkla
             try:
                 # Body'nin sonuna eklenen görünür (portal/popper) w-select-dropdown içindeki "New" seçeneğini bul
@@ -333,7 +336,7 @@ class DataScraper:
                 logger.debug(f"'New' seçeneği bulunamadı veya tıklanamadı: {e}")
                 await page.keyboard.press("Escape")
                 return False
-                
+
         except Exception as e:
             logger.debug(f"Sıralama değiştirme hatası: {e}")
             try:
@@ -347,7 +350,7 @@ class DataScraper:
         bargain_results = []
         try:
             logger.info(f"[Worker] Detay sayfası işleniyor: {skin_name}")
-            
+
             # Retry mekanizması: 2 deneme
             page_loaded = False
             for attempt in range(2):
@@ -369,10 +372,10 @@ class DataScraper:
                             pass
                     logger.warning(f"[Worker] '{skin_name}' tüm denemeler başarısız, TimeoutError fırlatılıyor.")
                     raise Exception("Timeout Error: Sayfa yüklemesi başarısız, proxy yavaş ya da ölü!")
-            
+
             if not page_loaded:
                 return bargain_results
-            
+
             content = await page.content()
             title = await page.title()
             if "Access denied" in content or "Cloudflare" in title or "Just a moment..." in title:
@@ -380,15 +383,15 @@ class DataScraper:
 
             await asyncio.sleep(random.uniform(2, 4))
             await self._cleanup_popups(page)
-            
+
             # Sıralamayı 'New' olarak ayarla
             sort_success = await self._set_sort_to_newest(page)
             if sort_success is False:
                 logger.warning(f"[Worker] '{skin_name}' için sıralama 'New' yapılamadı, atlanıyor.")
                 return [{"error": "sort_failed", "skin_name": skin_name}]
-            
+
             await self._scroll_slowly(page)
-            
+
             # "Buy" butonlarının belirmesini bekle
             try:
                 await page.locator("button:has-text('Buy'), button:has-text('BUY')").first.wait_for(state="visible", timeout=12000)
@@ -439,16 +442,16 @@ class DataScraper:
                     }
                     return 0.0;
                 }''')
-                
+
                 # JavaScript'ten string vb gelebilir, güvenlik:
                 reference_price = float(reference_price) if reference_price else 0.0
             except Exception as e:
                 logger.debug(f"[Worker] '{skin_name}' için referans fiyat alınamadı: {e}")
                 reference_price = 0.0
-                
+
             # DOM üzerinden row tespiti
             buy_buttons = await page.locator("button:has-text('Buy'), button:has-text('BUY')").all()
-            
+
             rows = []
             for btn in buy_buttons:
                 if await btn.is_visible():
@@ -467,15 +470,15 @@ class DataScraper:
 
             if not rows:
                 return bargain_results
-                
+
             valid_listings_checked = 0
-            
+
             for i, row_data in enumerate(rows):
                 if valid_listings_checked >= config.MAX_LISTINGS_TO_CHECK:
                     break
                 try:
                     row_handle = row_data["handle"]
-                    
+
                     # Satıcı, Wear Value ve StatTrak bilgilerini tek seferde çek
                     row_info = await row_handle.evaluate(r'''row => {
                         // --- Satıcı Adı ---
@@ -573,26 +576,26 @@ class DataScraper:
                         
                         return { seller, wearValue, isStatTrak, hasBargain, listingPrice };
                     }''')
-                    
+
                     seller = row_info.get("seller", "Bilinmeyen Satıcı")
                     wear_value = row_info.get("wearValue", "")
                     is_stattrak = row_info.get("isStatTrak", False)
                     has_bargain = row_info.get("hasBargain", False)
                     listing_price = row_info.get("listingPrice", 0.0)
-                    
+
                     # Eğer tamamen boş ve anlamsız bir satır geldiyse (örn. navbardaki Buy butonu), sayma ve atla
                     if seller == "Bilinmeyen Satıcı" and listing_price == 0.0:
                         continue
-                        
+
                     valid_listings_checked += 1
-                    
+
                     if seller.lower() == "market" or "inventory" in seller.lower():
                         continue
-                    
+
                     # Skin adından da StatTrak kontrolü (satır DOM'da yoksa)
                     if not is_stattrak and "stattrak" in skin_name.lower():
                         is_stattrak = True
-                    
+
                     if has_bargain:
                         skip_because_expensive = False
                         if reference_price > 0 and listing_price > 0:
@@ -601,7 +604,7 @@ class DataScraper:
                             if diff_percent > max_diff_percent:
                                 logger.info(f"⏭️ Bargain atlandı: {skin_name} (Satıcı: {seller}). İlan: {listing_price}, Normal: {reference_price}. Fark: +%{diff_percent:.1f} (> %{max_diff_percent})")
                                 skip_because_expensive = True
-                        
+
                         if not skip_because_expensive:
                             bargain_results.append({
                                 "skin_name": skin_name,
@@ -611,7 +614,7 @@ class DataScraper:
                                 "is_stattrak": is_stattrak
                             })
                             logger.info(f"🎉 BARGAIN BULUNDU! Skin: {skin_name}, Satıcı: {seller}, İlan Fiyatı: {listing_price}, Wear: {wear_value}, StatTrak: {is_stattrak}")
-                            
+
                 except Exception as e:
                     logger.debug(f"[Worker] Satır parse hatası: {e}")
 
@@ -623,25 +626,28 @@ class DataScraper:
             logger.warning(f"Detay sayfası timeout ({skin_name}), ürün atlanıyor.")
         except Exception as e:
             logger.error(f"Detay sayfası hatası ({skin_name}): {e}")
-            
+
         return bargain_results
 
     @staticmethod
     def _extract_goods_id(url: str) -> str:
         """URL'den goods_id çıkarır."""
-        if not url: return ""
+        if not url:
+            return ""
         try:
             if "/market/goods/" in url:
                 parts = url.split("/market/goods/")
                 if len(parts) > 1:
                     goods_part = parts[1].split("?")[0].split("#")[0]
                     goods_part = goods_part.strip("/")
-                    if goods_part: return goods_part
+                    if goods_part:
+                        return goods_part
             if "goods_id=" in url:
                 parts = url.split("goods_id=")
                 if len(parts) > 1:
                     gid = parts[1].split("&")[0].split("#")[0]
-                    if gid: return gid
+                    if gid:
+                        return gid
         except Exception:
             pass
         return ""
