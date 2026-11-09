@@ -60,7 +60,7 @@ def signal_handler(sig, frame):
         pass
     os._exit(0)
 
-async def monitor_task(scraper: DataScraper):
+async def monitor_task(scraper: DataScraper, new_work_event: asyncio.Event):
     """
     Yerel makinede ana market sayfasını tarayıp yeni ürünleri Supabase'e ekler.
     Kuyruk dağıtımı artık Supabase üzerinden olduğu için sadece DB'ye kaydeder.
@@ -77,23 +77,30 @@ async def monitor_task(scraper: DataScraper):
         logger.info("=" * 60)
         
         try:
-            current_last_scanned_id = get_last_scanned_id()
+            current_last_scanned_id = await asyncio.to_thread(get_last_scanned_id)
             skins, new_first_id, new_first_name = await scraper.fetch_skin_list(monitor_page, current_last_scanned_id)
             
-            if new_first_id and new_first_id != current_last_scanned_id:
-                set_last_scanned_id(new_first_id, new_first_name)
-                
             if not skins:
+                if new_first_id and new_first_id != current_last_scanned_id:
+                    await asyncio.to_thread(set_last_scanned_id, new_first_id, new_first_name)
                 logger.warning("[Monitor] Taranan listede tamamen aynı eşyalar mevcuttu veya hiç skin yoktu.")
             else:
-                existing_ids = get_all_skin_ids()
+                existing_ids = await asyncio.to_thread(get_all_skin_ids)
                 new_skins = [s for s in skins if s["id"] not in existing_ids]
                 
                 if new_skins:
                     logger.info(f"🆕 {len(new_skins)} yeni skin bulundu! Buluta (Supabase) aktarılıyor...")
                     batch_data = [{"skin_id": s["id"], "skin_name": s["name"], "wear_value": s.get("wear_value", "")} for s in new_skins]
-                    save_skins_batch(batch_data)
+                    saved_ok = await asyncio.to_thread(save_skins_batch, batch_data)
+                    if saved_ok:
+                        if new_first_id and new_first_id != current_last_scanned_id:
+                            await asyncio.to_thread(set_last_scanned_id, new_first_id, new_first_name)
+                        new_work_event.set()
+                    else:
+                        logger.warning("[Monitor] Skinler buluta kaydedilemediği için 'last_scanned_id' güncellenmedi; sonraki döngüde tekrar denenecek.")
                 else:
+                    if new_first_id and new_first_id != current_last_scanned_id:
+                        await asyncio.to_thread(set_last_scanned_id, new_first_id, new_first_name)
                     logger.info("[Monitor] Yeni skin bulunamadı. Listelenen tüm skinler bulutta bekliyor veya işlenmiş.")
                     
         except Exception as e:
@@ -113,24 +120,23 @@ async def monitor_task(scraper: DataScraper):
         pass
 
 
-async def dispatcher_task(queue: asyncio.Queue):
+async def dispatcher_task(queue: asyncio.Queue, new_work_event: asyncio.Event):
     """
-    İşçiler için Supabase'den RPC ile iş çeker. 
+    İşçiler için Supabase'den RPC ile iş çeker (Adaptive Backoff + Event destekli).
     Aynı anda alınan iş db'den silineceği için VM ile çakışma olmaz.
     """
     logger.info("[Dispatcher] Supabase kuyruk çekicisi başlatıldı.")
     
-    # Çok agresif sorgu yapmamak için bekleme süresi
-    fetch_interval = 10
+    fetch_interval = 4.0
+    pull_limit = max(BATCH_SIZE * MAX_WORKERS, 5)
     
     while running:
-        if queue.qsize() < 3: # Eğer kendi yerel işçi kuyruğumuzda az iş varsa
+        if queue.qsize() < 3:
             try:
-                # 30 adet (veya worker başı batch hesabı) ürün alalım
-                batch = get_work_batch(BATCH_SIZE * MAX_WORKERS)
+                batch = await asyncio.to_thread(get_work_batch, pull_limit)
                 if batch:
+                    fetch_interval = 4.0
                     logger.info(f"[Dispatcher] Veritabanından {len(batch)} adet ürün işlenmek üzere çekildi.")
-                    # Batch'leri ayarlayarak kuyruğa (Queue) verelim
                     for i in range(0, len(batch), BATCH_SIZE):
                         slice_items = batch[i:i + BATCH_SIZE]
                         worker_items = []
@@ -142,13 +148,20 @@ async def dispatcher_task(queue: asyncio.Queue):
                                 "url": f"{TARGET_BASE_URL}/market/goods/{s['skin_id']}?game=csgo"
                             })
                         await queue.put(worker_items)
+                else:
+                    # Kuyruk boşsa bekleme süresini kademeli olarak 12 saniyeye kadar çıkar
+                    fetch_interval = min(fetch_interval + 2.0, 12.0)
             except Exception as e:
                 logger.error(f"[Dispatcher] İş çekme hatası: {e}")
+                fetch_interval = 10.0
                 
-        # Boş bekleyişlerde loop bloklamasın
-        for _ in range(fetch_interval):
-            if not running: break
-            await asyncio.sleep(1)
+        # Boş bekleyişlerde Monitor yeni iş eklerse anında uyan
+        new_work_event.clear()
+        try:
+            await asyncio.wait_for(new_work_event.wait(), timeout=fetch_interval)
+            fetch_interval = 2.0
+        except asyncio.TimeoutError:
+            pass
 
 
 async def worker_task(worker_id: int, scraper: DataScraper, queue: asyncio.Queue):
@@ -183,7 +196,7 @@ async def worker_task(worker_id: int, scraper: DataScraper, queue: asyncio.Queue
                      
                      for bargain in bargain_items:
                          if bargain.get("error") == "sort_failed":
-                             send_scan_error_message(bargain.get("skin_name", "Bilinmeyen Skin"))
+                             await asyncio.to_thread(send_scan_error_message, bargain.get("skin_name", "Bilinmeyen Skin"))
                              continue
                              
                          seller_lower = bargain["seller"].strip().lower()
@@ -191,25 +204,35 @@ async def worker_task(worker_id: int, scraper: DataScraper, queue: asyncio.Queue
                              logger.info(f"⛔ Engelli satıcı atlandı: {bargain['seller']}")
                              continue
                          
-                         if is_bargain_notified(bargain["skin_name"], bargain["seller"], bargain.get("wear_value", "")):
+                         already_notified = await asyncio.to_thread(
+                             is_bargain_notified,
+                             bargain["skin_name"],
+                             bargain["seller"],
+                             bargain.get("wear_value", "")
+                         )
+                         if already_notified:
                              logger.info(f"⏭️ Zaten bildirildi, atlanıyor: {bargain['skin_name']} (Satıcı: {bargain['seller']}, Float: {bargain.get('wear_value', '')})")
                              log_skipped_bargain(bargain["skin_name"], bargain["seller"], bargain.get("wear_value", ""))
                              continue
                              
-                         send_notification(
+                         await asyncio.to_thread(
+                             send_notification,
                              skin_name=bargain["skin_name"],
                              seller=bargain["seller"],
                              link=bargain["link"],
                              wear_value=bargain.get("wear_value", ""),
                              is_stattrak=bargain.get("is_stattrak", False)
                          )
-                         mark_bargain_notified(bargain["skin_name"], bargain["seller"], bargain.get("wear_value", ""))
+                         await asyncio.to_thread(
+                             mark_bargain_notified,
+                             bargain["skin_name"],
+                             bargain["seller"],
+                             bargain.get("wear_value", "")
+                         )
                          total_bargains += 1
                          
-                     # (Not: get_work_batch çalışırken veriyi Supabase'den sildiği için burada ekstra delete_skin çağırmıyoruz)
                  except Exception as e:
                      logger.error(f"[Worker-{worker_id}] Skin işleme hatası ({skin['name']}): {e}")
-                     # Normalde başarısız olunca DB'den siliniyordu, şimdi sildiği DB'ye geri eklemiyoruz hata verse bile (opsiyonel).
                      
              logger.info(f"[Worker-{worker_id}] Paket tamamlandı. Toplam {total_bargains} bargain bildirildi.")
                      
@@ -266,14 +289,15 @@ async def main_async():
     logger.info("Facebook Login aşaması bitti. Görevler dağıtılıyor...")
     
     queue = asyncio.Queue()
+    new_work_event = asyncio.Event()
     tasks = []
     
     # 1. Ana sayfayı tarayıp Supabase'e iten monitor
-    monitor = asyncio.create_task(monitor_task(scraper))
+    monitor = asyncio.create_task(monitor_task(scraper, new_work_event))
     tasks.append(monitor)
     
     # 2. İşleri Supabase'den çekip kuyruğa ekleyen dağıtıcı
-    dispatcher = asyncio.create_task(dispatcher_task(queue))
+    dispatcher = asyncio.create_task(dispatcher_task(queue, new_work_event))
     tasks.append(dispatcher)
     
     # 3. İlanların içine tek tek giren işçiler

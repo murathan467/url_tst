@@ -53,7 +53,7 @@ async def dispatcher_task(queue: asyncio.Queue):
     while running:
         if queue.qsize() < 2: 
             try:
-                batch = get_work_batch(pull_limit)
+                batch = await asyncio.to_thread(get_work_batch, pull_limit)
                 if batch:
                     fetch_interval = 3.0  # İş bulundu, aktif moda geç
                     logger.info(f"[Dispatcher] Veritabanından {len(batch)} adet ürün işlenmek üzere çekildi.")
@@ -109,7 +109,7 @@ async def worker_task(worker_id: str, scraper: DataScraper, queue: asyncio.Queue
                      
                      for bargain in bargain_items:
                          if bargain.get("error") == "sort_failed":
-                             send_scan_error_message(bargain.get("skin_name", "Bilinmeyen Skin"))
+                             await asyncio.to_thread(send_scan_error_message, bargain.get("skin_name", "Bilinmeyen Skin"))
                              continue
                              
                          seller_lower = bargain["seller"].strip().lower()
@@ -117,19 +117,31 @@ async def worker_task(worker_id: str, scraper: DataScraper, queue: asyncio.Queue
                              logger.info(f"⛔ Engelli satıcı atlandı: {bargain['seller']}")
                              continue
                          
-                         if is_bargain_notified(bargain["skin_name"], bargain["seller"], bargain.get("wear_value", "")):
+                         already_notified = await asyncio.to_thread(
+                             is_bargain_notified,
+                             bargain["skin_name"],
+                             bargain["seller"],
+                             bargain.get("wear_value", "")
+                         )
+                         if already_notified:
                              logger.info(f"⏭️ Zaten bildirildi, atlanıyor: {bargain['skin_name']} (Satıcı: {bargain['seller']})")
                              log_skipped_bargain(bargain["skin_name"], bargain["seller"], bargain.get("wear_value", ""))
                              continue
                              
-                         send_notification(
+                         await asyncio.to_thread(
+                             send_notification,
                              skin_name=bargain["skin_name"],
                              seller=bargain["seller"],
                              link=bargain["link"],
                              wear_value=bargain.get("wear_value", ""),
                              is_stattrak=bargain.get("is_stattrak", False)
                          )
-                         mark_bargain_notified(bargain["skin_name"], bargain["seller"], bargain.get("wear_value", ""))
+                         await asyncio.to_thread(
+                             mark_bargain_notified,
+                             bargain["skin_name"],
+                             bargain["seller"],
+                             bargain.get("wear_value", "")
+                         )
                          total_bargains += 1
                          
                  except Exception as e:

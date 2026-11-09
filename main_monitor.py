@@ -73,23 +73,29 @@ async def monitor_task(scraper: DataScraper):
         logger.info("=" * 60)
         
         try:
-            current_last_scanned_id = get_last_scanned_id()
+            current_last_scanned_id = await asyncio.to_thread(get_last_scanned_id)
             skins, new_first_id, new_first_name = await scraper.fetch_skin_list(monitor_page, current_last_scanned_id)
             
-            if new_first_id and new_first_id != current_last_scanned_id:
-                set_last_scanned_id(new_first_id, new_first_name)
-                
             if not skins:
+                if new_first_id and new_first_id != current_last_scanned_id:
+                    await asyncio.to_thread(set_last_scanned_id, new_first_id, new_first_name)
                 logger.warning("[Monitor] Taranan listede tamamen aynı eşyalar mevcuttu veya hiç skin yoktu.")
             else:
-                existing_ids = get_all_skin_ids()
+                existing_ids = await asyncio.to_thread(get_all_skin_ids)
                 new_skins = [s for s in skins if s["id"] not in existing_ids]
                 
                 if new_skins:
                     logger.info(f"🆕 {len(new_skins)} yeni skin bulundu! Buluta (Supabase) aktarılıyor...")
                     batch_data = [{"skin_id": s["id"], "skin_name": s["name"], "wear_value": s.get("wear_value", "")} for s in new_skins]
-                    save_skins_batch(batch_data)
+                    saved_ok = await asyncio.to_thread(save_skins_batch, batch_data)
+                    if saved_ok:
+                        if new_first_id and new_first_id != current_last_scanned_id:
+                            await asyncio.to_thread(set_last_scanned_id, new_first_id, new_first_name)
+                    else:
+                        logger.warning("[Monitor] Skinler buluta kaydedilemediği için 'last_scanned_id' güncellenmedi; sonraki döngüde tekrar denenecek.")
                 else:
+                    if new_first_id and new_first_id != current_last_scanned_id:
+                        await asyncio.to_thread(set_last_scanned_id, new_first_id, new_first_name)
                     logger.info("[Monitor] Yeni skin bulunamadı. Listelenen tüm skinler bulutta bekliyor veya işlenmiş.")
                     
         except Exception as e:
