@@ -37,6 +37,8 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 # ========================
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+SUPABASE_ACCESS_TOKEN = os.getenv("SUPABASE_ACCESS_TOKEN", "")
+SUPABASE_PROJECT_REF = os.getenv("SUPABASE_PROJECT_REF", "vlwvpcirdopiohpuyhso")
 
 # ========================
 # Kimlik Doğrulama Ayarları
