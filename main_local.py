@@ -8,7 +8,7 @@ import asyncio
 from datetime import datetime
 
 from config import MAX_WORKERS, BATCH_SIZE, SCAN_INTERVAL_MIN, SCAN_INTERVAL_MAX, TARGET_BASE_URL, TARGET_LIST_URL, BLOCKED_SELLERS
-from database import init_db, save_skin, save_skins_batch, get_all_skin_ids, get_work_batch, is_bargain_notified, mark_bargain_notified, clear_all_skins, log_skipped_bargain, get_last_scanned_id, set_last_scanned_id
+from database import init_db, save_skin, save_skins_batch, get_all_skin_ids, get_work_batch, is_bargain_notified, mark_bargain_notified, clear_all_skins, log_skipped_bargain, get_last_scanned_id, set_last_scanned_id, trim_old_skins
 from scraper import DataScraper
 from telegram_bot import send_notification, send_startup_message, send_scan_error_message
 
@@ -71,7 +71,12 @@ async def monitor_task(scraper: DataScraper, new_work_event: asyncio.Event):
         logger.info(f" YENİ TARAMA DÖNGÜSÜ #{cycle_count} — {datetime.now().strftime('%H:%M:%S')}")
         logger.info("=" * 60)
         
+        db_congested = False
         try:
+            # Her 10 döngüde bir tablo 5.000 satırı aştıysa en eski 4.000 satırı temizle
+            if cycle_count % 10 == 0:
+                await asyncio.to_thread(trim_old_skins, 5000, 4000)
+
             current_last_scanned_id = await asyncio.to_thread(get_last_scanned_id)
             skins, new_first_id, new_first_name = await scraper.fetch_skin_list(monitor_page, current_last_scanned_id)
             
@@ -92,7 +97,8 @@ async def monitor_task(scraper: DataScraper, new_work_event: asyncio.Event):
                             await asyncio.to_thread(set_last_scanned_id, new_first_id, new_first_name)
                         new_work_event.set()
                     else:
-                        logger.warning("[Monitor] Skinler buluta kaydedilemediği için 'last_scanned_id' güncellenmedi; sonraki döngüde tekrar denenecek.")
+                        db_congested = True
+                        logger.warning("[Monitor] Skinler buluta kaydedilemediği için 'last_scanned_id' güncellenmedi; veritabanı rahatlaması için ekstra beklenecek.")
                 else:
                     if new_first_id and new_first_id != current_last_scanned_id:
                         await asyncio.to_thread(set_last_scanned_id, new_first_id, new_first_name)
@@ -101,8 +107,12 @@ async def monitor_task(scraper: DataScraper, new_work_event: asyncio.Event):
         except Exception as e:
             logger.error(f"[Monitor] Döngü hatası: {e}")
             
-        sleep_time = random.uniform(SCAN_INTERVAL_MIN, SCAN_INTERVAL_MAX)
-        logger.info(f"[Monitor] Sonraki tarama {sleep_time:.1f} saniye sonra...")
+        if db_congested:
+            sleep_time = random.uniform(25.0, 35.0)
+            logger.warning(f"[Monitor] Veritabanı yoğunluğu (Backoff): {sleep_time:.1f} saniye bekleniyor...")
+        else:
+            sleep_time = random.uniform(SCAN_INTERVAL_MIN, SCAN_INTERVAL_MAX)
+            logger.info(f"[Monitor] Sonraki tarama {sleep_time:.1f} saniye sonra...")
         iterations = int(sleep_time * 10)
         for _ in range(iterations):
             if not running: break
@@ -207,7 +217,7 @@ async def worker_task(worker_id: int, scraper: DataScraper, queue: asyncio.Queue
                          )
                          if already_notified:
                              logger.info(f"⏭️ Zaten bildirildi, atlanıyor: {bargain['skin_name']} (Satıcı: {bargain['seller']}, Float: {bargain.get('wear_value', '')})")
-                             log_skipped_bargain(bargain["skin_name"], bargain["seller"], bargain.get("wear_value", ""))
+                             await asyncio.to_thread(log_skipped_bargain, bargain["skin_name"], bargain["seller"], bargain.get("wear_value", ""))
                              continue
                              
                          await asyncio.to_thread(

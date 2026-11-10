@@ -142,7 +142,7 @@ async def worker_task(worker_id: int, scraper: DataScraper, queue: asyncio.Queue
                          )
                          if already_notified:
                              logger.info(f"⏭️ Zaten bildirildi, atlanıyor: {bargain['skin_name']} (Satıcı: {bargain['seller']}, Float: {bargain.get('wear_value', '')})")
-                             log_skipped_bargain(bargain["skin_name"], bargain["seller"], bargain.get("wear_value", ""))
+                             await asyncio.to_thread(log_skipped_bargain, bargain["skin_name"], bargain["seller"], bargain.get("wear_value", ""))
                              continue
                              
                          await asyncio.to_thread(

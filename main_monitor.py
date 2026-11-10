@@ -8,7 +8,7 @@ import asyncio
 from datetime import datetime
 
 from config import SCAN_INTERVAL_MIN, SCAN_INTERVAL_MAX, TARGET_LIST_URL
-from database import init_db, save_skin, save_skins_batch, get_all_skin_ids, clear_all_skins, get_last_scanned_id, set_last_scanned_id
+from database import init_db, save_skin, save_skins_batch, get_all_skin_ids, clear_all_skins, get_last_scanned_id, set_last_scanned_id, trim_old_skins
 from scraper import DataScraper
 from telegram_bot import send_startup_message
 
@@ -67,7 +67,11 @@ async def monitor_task(scraper: DataScraper):
         logger.info(f" YENİ TARAMA DÖNGÜSÜ #{cycle_count} — {datetime.now().strftime('%H:%M:%S')}")
         logger.info("=" * 60)
         
+        db_congested = False
         try:
+            if cycle_count % 10 == 0:
+                await asyncio.to_thread(trim_old_skins, 5000, 4000)
+
             current_last_scanned_id = await asyncio.to_thread(get_last_scanned_id)
             skins, new_first_id, new_first_name = await scraper.fetch_skin_list(monitor_page, current_last_scanned_id)
             
@@ -87,7 +91,8 @@ async def monitor_task(scraper: DataScraper):
                         if new_first_id and new_first_id != current_last_scanned_id:
                             await asyncio.to_thread(set_last_scanned_id, new_first_id, new_first_name)
                     else:
-                        logger.warning("[Monitor] Skinler buluta kaydedilemediği için 'last_scanned_id' güncellenmedi; sonraki döngüde tekrar denenecek.")
+                        db_congested = True
+                        logger.warning("[Monitor] Skinler buluta kaydedilemediği için 'last_scanned_id' güncellenmedi; veritabanı rahatlaması için ekstra beklenecek.")
                 else:
                     if new_first_id and new_first_id != current_last_scanned_id:
                         await asyncio.to_thread(set_last_scanned_id, new_first_id, new_first_name)
@@ -96,8 +101,12 @@ async def monitor_task(scraper: DataScraper):
         except Exception as e:
             logger.error(f"[Monitor] Döngü hatası: {e}")
             
-        sleep_time = random.uniform(SCAN_INTERVAL_MIN, SCAN_INTERVAL_MAX)
-        logger.info(f"[Monitor] Sonraki tarama {sleep_time:.1f} saniye sonra...")
+        if db_congested:
+            sleep_time = random.uniform(25.0, 35.0)
+            logger.warning(f"[Monitor] Veritabanı yoğunluğu (Backoff): {sleep_time:.1f} saniye bekleniyor...")
+        else:
+            sleep_time = random.uniform(SCAN_INTERVAL_MIN, SCAN_INTERVAL_MAX)
+            logger.info(f"[Monitor] Sonraki tarama {sleep_time:.1f} saniye sonra...")
         # Küçük sleep'lerle running kontrolü yapmak için:
         iterations = int(sleep_time * 10)
         for _ in range(iterations):
