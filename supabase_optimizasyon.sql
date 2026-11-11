@@ -2,16 +2,20 @@
 -- SUPABASE (BuffBotDb) VERİTABANI KİLİTLENME (LOCK) VE ŞİŞME (BLOAT) ÇÖZÜMÜ
 -- ============================================================================
 
--- 1. İNDEKSLER (Sıralama ve Arama Hızlandırma)
-CREATE INDEX IF NOT EXISTS idx_skins_processed_at ON public.skins (processed_at ASC);
-CREATE INDEX IF NOT EXISTS idx_skins_skin_id ON public.skins (skin_id);
+-- 1. İNDEKS VE BELLEK (RAM / SWAP) OPTİMİZASYONU
+-- PRIMARY KEY (id) ve UNIQUE (skin_id, key_name) zaten otomatik B-Tree indeks oluşturur.
+-- Kopya indeksleri silerek Supabase'in 411 MB RAM'indeki "Cache + Buffers" yükünü azaltıyoruz.
+DROP INDEX IF EXISTS public.idx_skins_id;
+DROP INDEX IF EXISTS public.idx_skins_skin_id;
+DROP INDEX IF EXISTS public.idx_skins_processed_at;
+DROP INDEX IF EXISTS public.idx_system_state_key;
+
 CREATE INDEX IF NOT EXISTS idx_notified_bargains_lookup ON public.notified_bargains (skin_name, seller, float_value);
 
--- 2. KİLİTLENMEYİ ÖNLEYEN RPC FONKSİYONU (FOR UPDATE SKIP LOCKED)
--- 4 farklı bot düğümü aynı anda iş çekerken veya Monitor yeni ilan eklerken
--- birbirlerinin kilitlediği satırları beklemez (SKIP LOCKED), anında sıradaki
--- boş satırları alıp siler. Böylece "statement timeout (57014)" hatası tamamen biter.
-CREATE OR REPLACE FUNCTION public.get_and_delete_skins(batch_limit integer DEFAULT 5)
+-- 2. KİLİTLENMEYİ ÖNLEYEN RPC FONKSİYONU (FOR UPDATE SKIP LOCKED — EN GÜNCEL ÖNCELİKLİ)
+-- 4 farklı bot düğümü aynı anda iş çekerken birbirlerinin kilitlediği satırları beklemez (SKIP LOCKED),
+-- anında en güncel (ORDER BY id DESC) boş satırları alıp siler.
+CREATE OR REPLACE FUNCTION public.get_and_delete_skins(batch_limit integer DEFAULT 8)
 RETURNS SETOF public.skins
 LANGUAGE plpgsql
 AS $$
@@ -31,18 +35,16 @@ BEGIN
 END;
 $$;
 
--- 3. 5.000 SATIRI AŞINCA EN ESKİ 4.000 SATIRI SİLEN RPC FONKSİYONU
-CREATE OR REPLACE FUNCTION public.trim_old_skins(max_rows integer DEFAULT 5000, delete_count integer DEFAULT 4000)
+-- 3. 150 SATIRI AŞINCA EN ESKİ 100 SATIRI SİLEN HAFİF RPC FONKSİYONU (COUNT(*) TARAMASI YOK)
+CREATE OR REPLACE FUNCTION public.trim_old_skins(max_rows integer DEFAULT 150, delete_count integer DEFAULT 100)
 RETURNS integer
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    current_count integer;
     deleted_rows integer := 0;
 BEGIN
-    SELECT count(*) INTO current_count FROM public.skins;
-
-    IF current_count > max_rows THEN
+    -- COUNT(*) tüm tabloyu tarayıp RAM/IO tükettiği için sadece max_rows'uncu satır var mı diye bakıyoruz
+    IF EXISTS (SELECT 1 FROM public.skins OFFSET max_rows LIMIT 1) THEN
         WITH to_delete AS (
             SELECT id FROM public.skins
             ORDER BY id ASC
@@ -55,20 +57,15 @@ BEGIN
         GET DIAGNOSTICS deleted_rows = ROW_COUNT;
     END IF;
 
-    -- Yan tabloların da zamanla şişmesini önle
-    DELETE FROM public.skipped_bargains
-    WHERE id IN (
-        SELECT id FROM public.skipped_bargains
-        ORDER BY id ASC
-        OFFSET 500
-    );
-
-    DELETE FROM public.notified_bargains
-    WHERE id IN (
-        SELECT id FROM public.notified_bargains
-        ORDER BY id DESC
-        OFFSET 2000
-    );
+    -- Bildirim tablosunun da RAM'de şişmesini önle (En son 300 bildirimi tut)
+    IF EXISTS (SELECT 1 FROM public.notified_bargains OFFSET 300 LIMIT 1) THEN
+        DELETE FROM public.notified_bargains
+        WHERE id IN (
+            SELECT id FROM public.notified_bargains
+            ORDER BY id DESC
+            OFFSET 300
+        );
+    END IF;
 
     RETURN deleted_rows;
 END;

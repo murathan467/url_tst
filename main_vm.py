@@ -55,22 +55,24 @@ def signal_handler(sig, frame):
 
 async def dispatcher_task(queue: asyncio.Queue):
     """
-    İşçiler için Supabase'den RPC ile iş çeker (Adaptive Backoff destekli).
+    İşçiler için Supabase'den RPC ile iş çeker (Kademeli Backoff: 5 -> 15 -> 35 -> 45 sn).
     Aynı anda alınan iş db'den silineceği için yerel makine ile çakışma olmaz.
     """
-    logger.info("[Dispatcher] Supabase kuyruk çekicisi başlatıldı.")
+    logger.info("[Dispatcher] Supabase kuyruk çekicisi başlatıldı (Kademeli Backoff: 5/15/35/45s).")
     
-    fetch_interval = 4.0
-    pull_limit = max(BATCH_SIZE * MAX_WORKERS, 5)
+    backoff_steps = (5.0, 15.0, 35.0, 45.0)
+    empty_streak = 0
+    fetch_interval = 5.0
+    pull_limit = max(BATCH_SIZE * MAX_WORKERS, 8)
     
     while running:
-        if queue.qsize() < 3: # Eğer kendi yerel işçi kuyruğumuzda az iş varsa
+        if queue.qsize() <= 1:  # Sadece eldeki iş bitmek üzereyken en güncel paketi çek
             try:
                 batch = await asyncio.to_thread(get_work_batch, pull_limit)
                 if batch:
-                    fetch_interval = 4.0
-                    logger.info(f"[Dispatcher] Veritabanından {len(batch)} adet ürün işlenmek üzere çekildi.")
-                    # Batch'leri ayarlayarak kuyruğa (Queue) verelim
+                    empty_streak = 0
+                    fetch_interval = 5.0
+                    logger.info(f"[Dispatcher] Veritabanından {len(batch)} adet en güncel ürün çekildi.")
                     for i in range(0, len(batch), BATCH_SIZE):
                         slice_items = batch[i:i + BATCH_SIZE]
                         worker_items = []
@@ -83,10 +85,14 @@ async def dispatcher_task(queue: asyncio.Queue):
                             })
                         await queue.put(worker_items)
                 else:
-                    fetch_interval = min(fetch_interval + 2.0, 12.0)
+                    fetch_interval = backoff_steps[min(empty_streak, len(backoff_steps) - 1)]
+                    empty_streak += 1
+                    logger.info(f"[Dispatcher] Kuyruk boş (Deneme #{empty_streak}). {fetch_interval:.0f} sn bekleniyor...")
             except Exception as e:
                 logger.error(f"[Dispatcher] İş çekme hatası: {e}")
-                fetch_interval = 10.0
+                fetch_interval = 35.0
+        else:
+            fetch_interval = 5.0
                 
         iterations = int(fetch_interval * 10)
         for _ in range(iterations):

@@ -24,6 +24,9 @@ def _patched_client_init(self, *args, **kwargs):
     kwargs["timeout"] = httpx.Timeout(
         10.0, connect=5.0, read=10.0, write=10.0, pool=5.0
     )
+    kwargs["limits"] = httpx.Limits(
+        max_connections=2, max_keepalive_connections=1, keepalive_expiry=15.0
+    )
     _original_client_init(self, *args, **kwargs)
 
 
@@ -35,8 +38,8 @@ supabase: Client = None
 _client_lock = threading.Lock()
 _cache_lock = threading.RLock()
 
-# Eşzamanlı (Concurrent) İstekleri Sınırlandırmak için Semaphore
-db_semaphore = asyncio.Semaphore(5)
+# Eşzamanlı (Concurrent) İstekleri Sınırlandırmak için Semaphore (Supabase RAM Koruması)
+db_semaphore = asyncio.Semaphore(1)
 
 # ==========================================================
 # DİSK IO OPTİMİZASYONU: BELLEK İÇİ ÖNBELLEKLER (RAM CACHE)
@@ -145,14 +148,14 @@ def init_db():
 
 
 def _preload_notified_cache():
-    """Başlangıçta son 300 bildirimi RAM'e çeker, tekrarlayan SELECT sorgularını önler."""
+    """Başlangıçta son 150 bildirimi RAM'e çeker, tekrarlayan SELECT sorgularını önler."""
     global _notified_cache
     try:
         res = _execute_with_retry(
             lambda client: client.table("notified_bargains")
             .select("skin_name, seller, float_value")
             .order("id", desc=True)
-            .limit(300)
+            .limit(150)
             .execute(),
             action_name="Preload Notified Cache",
             retries=1,
@@ -261,7 +264,19 @@ def save_skins_batch(skins_list: list) -> bool:
         if not formatted_list:
             return True
 
-        # 50'şerli parçalar halinde tek seferde upsert yaparak PostgREST istek yükünü azalt
+        # En güncel verileri önceliklendir: Tek döngüde 3 Worker'ın taze eritebileceğinden fazlasını (max 20) DB'ye yığma
+        with _cache_lock:
+            for item in formatted_list:
+                _known_skin_ids_cache.add(item["skin_id"])
+            if len(_known_skin_ids_cache) > 500:
+                # Bellek şişmesini önlemek için sadece son 300 ID'yi tut
+                excess = len(_known_skin_ids_cache) - 300
+                for _ in range(excess):
+                    _known_skin_ids_cache.pop()
+
+        formatted_list = formatted_list[:20]
+
+        # Tek seferde upsert yaparak PostgREST istek yükünü azalt
         chunk_size = 50
         for i in range(0, len(formatted_list), chunk_size):
             chunk = formatted_list[i : i + chunk_size]
@@ -278,10 +293,6 @@ def save_skins_batch(skins_list: list) -> bool:
                 retries=2,
             )
 
-        with _cache_lock:
-            for item in formatted_list:
-                _known_skin_ids_cache.add(item["skin_id"])
-
         logger.info(
             f"{len(formatted_list)} adet yeni skin toplu olarak (Bulk Upsert)"
             " buluta eklendi."
@@ -293,11 +304,11 @@ def save_skins_batch(skins_list: list) -> bool:
 
 
 def _trim_table_by_pk(
-    table_name: str, max_rows: int = 5000, delete_count: int = 4000
+    table_name: str, max_rows: int = 150, delete_count: int = 100
 ) -> int:
     """Primary Key (id) indeksini kullanarak COUNT(*) tablosu taraması yapmadan
 
-    tablo boyutu max_rows'u (5000) aşmışsa en eski delete_count (4000) kaydı
+    tablo boyutu max_rows'u (150) aşmışsa en eski delete_count (100) kaydı
     siler.
     """
     try:
@@ -332,16 +343,18 @@ def _trim_table_by_pk(
         return 0
 
 
-def trim_old_skins(max_rows: int = 5000, delete_count: int = 4000) -> int:
-    """Veritabanındaki kayıt sayısı 5000'i geçerse en eski 4000 taneyi otomatik olarak siler.
+def trim_old_skins(max_rows: int = 150, delete_count: int = 100) -> int:
+    """Veritabanındaki kayıt sayısı max_rows'u (150) geçerse en eski delete_count (100) taneyi siler.
 
-    Önce Supabase'deki 'trim_old_skins' RPC fonksiyonunu dener; yoksa indeks
-    tabanlı temizlik yapar.
+    Böylece Supabase RAM/Swap şişmez ve Worker'lar her zaman en güncel ürünleri çeker.
     """
     total_deleted = 0
     try:
         client = _get_or_create_client()
-        res = client.rpc("trim_old_skins").execute()
+        res = client.rpc(
+            "trim_old_skins",
+            {"max_rows": max_rows, "delete_count": delete_count},
+        ).execute()
         if isinstance(res.data, int):
             total_deleted = res.data
     except Exception:
@@ -349,16 +362,14 @@ def trim_old_skins(max_rows: int = 5000, delete_count: int = 4000) -> int:
             "skins", max_rows=max_rows, delete_count=delete_count
         )
         deleted_n = _trim_table_by_pk(
-            "notified_bargains", max_rows=max_rows, delete_count=delete_count
+            "notified_bargains", max_rows=300, delete_count=150
         )
         total_deleted = deleted_s + deleted_n
 
     if total_deleted > 0:
-        with _cache_lock:
-            _known_skin_ids_cache.clear()
         logger.info(
             f"🧹 Veritabanı temizliği: En eski {total_deleted} kayıt silindi"
-            f" ({max_rows} sınırı aşıldı)."
+            f" ({max_rows} taze kuyruk sınırı korundu)."
         )
     return total_deleted
 
@@ -454,7 +465,7 @@ def set_last_scanned_id(skin_id: str, skin_name: str = ""):
         logger.info(f"Son okunan eşya güncellendi: {skin_name} (ID: {skin_id})")
 
         now_ts = time.time()
-        if now_ts - _last_state_sync_time < 60.0:
+        if now_ts - _last_state_sync_time < 180.0:
             return
         _last_state_sync_time = now_ts
 
@@ -499,15 +510,18 @@ def get_all_skin_ids() -> set:
     global _known_skin_ids_cache, _skin_ids_cache_loaded
     with _cache_lock:
         if _skin_ids_cache_loaded:
-            if len(_known_skin_ids_cache) > 5000:
-                _known_skin_ids_cache.clear()
+            if len(_known_skin_ids_cache) > 500:
+                excess = len(_known_skin_ids_cache) - 300
+                for _ in range(excess):
+                    _known_skin_ids_cache.pop()
             return _known_skin_ids_cache.copy()
 
     try:
         response = _execute_with_retry(
             lambda client: client.table("skins")
             .select("skin_id")
-            .limit(2000)
+            .order("id", desc=True)
+            .limit(150)
             .execute(),
             action_name="get_all_skin_ids",
             retries=1,
@@ -533,10 +547,6 @@ def get_work_batch(limit: int) -> list:
             retries=2,
         )
         data = response.data or []
-        if data:
-            with _cache_lock:
-                for row in data:
-                    _known_skin_ids_cache.discard(row.get("skin_id"))
         return data
     except Exception as e:
         logger.error(f"Supabase toplu iş çekme hatası: {e}")
@@ -546,33 +556,10 @@ def get_work_batch(limit: int) -> list:
 def is_bargain_notified(
     skin_name: str, seller: str, float_value: str = ""
 ) -> bool:
+    """Ekstra SELECT sorgusu atmadan doğrudan önbellekten kontrol eder (Disk IO & RAM Koruması)."""
     key = (skin_name, seller, float_value)
     with _cache_lock:
-        if key in _notified_cache:
-            return True
-
-    try:
-        response = _execute_with_retry(
-            lambda client: (
-                client.table("notified_bargains")
-                .select("id")
-                .eq("skin_name", skin_name)
-                .eq("seller", seller)
-                .eq("float_value", float_value)
-                .limit(1)
-                .execute()
-            ),
-            action_name="is_bargain_notified",
-            retries=1,
-        )
-        exists = len(response.data) > 0
-        if exists:
-            with _cache_lock:
-                _notified_cache.add(key)
-        return exists
-    except Exception as e:
-        logger.error(f"Bargain bildirim kontrolü hatası: {e}")
-        return False
+        return key in _notified_cache
 
 
 def mark_bargain_notified(skin_name: str, seller: str, float_value: str = ""):
@@ -580,6 +567,8 @@ def mark_bargain_notified(skin_name: str, seller: str, float_value: str = ""):
     with _cache_lock:
         if key in _notified_cache:
             return
+        if len(_notified_cache) > 300:
+            _notified_cache.pop()
         _notified_cache.add(key)
 
     try:

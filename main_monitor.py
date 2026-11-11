@@ -69,8 +69,8 @@ async def monitor_task(scraper: DataScraper):
         
         db_congested = False
         try:
-            if cycle_count % 10 == 0:
-                await asyncio.to_thread(trim_old_skins, 5000, 4000)
+            if cycle_count % 50 == 0:
+                await asyncio.to_thread(trim_old_skins, 150, 100)
 
             current_last_scanned_id = await asyncio.to_thread(get_last_scanned_id)
             skins, new_first_id, new_first_name = await scraper.fetch_skin_list(monitor_page, current_last_scanned_id)

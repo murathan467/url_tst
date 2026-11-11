@@ -16,3 +16,5 @@ cookie_olustur.bat
 extract_prices_test.py
 test_buff_dom.py
 test_parse_html.py
+
+/graphify-out

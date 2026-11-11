@@ -55,10 +55,10 @@ def signal_handler(sig, frame):
     running = False
     os._exit(0)
 
-async def monitor_task(scraper: DataScraper, new_work_event: asyncio.Event):
+async def monitor_task(scraper: DataScraper, queue: asyncio.Queue, new_work_event: asyncio.Event):
     """
-    Yerel makinede ana market sayfasını tarayıp yeni ürünleri Supabase'e ekler.
-    Kuyruk dağıtımı artık Supabase üzerinden olduğu için sadece DB'ye kaydeder.
+    Yerel makinede ana market sayfasını tarayıp yeni ürünleri önce kendi boş işçilerine,
+    kalanını ise diğer Worker düğümleri için Supabase'e ekler.
     """
     monitor_page = await scraper.context.new_page()
     logger.info("[Monitor] Yeni sekme oluşturuldu. Tarama başlatılıyor...")
@@ -73,9 +73,9 @@ async def monitor_task(scraper: DataScraper, new_work_event: asyncio.Event):
         
         db_congested = False
         try:
-            # Her 10 döngüde bir tablo 5.000 satırı aştıysa en eski 4.000 satırı temizle
-            if cycle_count % 10 == 0:
-                await asyncio.to_thread(trim_old_skins, 5000, 4000)
+            # Her 50 döngüde bir tablo 150 satırı aştıysa en eski 100 bayat satırı temizle
+            if cycle_count % 50 == 0:
+                await asyncio.to_thread(trim_old_skins, 150, 100)
 
             current_last_scanned_id = await asyncio.to_thread(get_last_scanned_id)
             skins, new_first_id, new_first_name = await scraper.fetch_skin_list(monitor_page, current_last_scanned_id)
@@ -89,16 +89,41 @@ async def monitor_task(scraper: DataScraper, new_work_event: asyncio.Event):
                 new_skins = [s for s in skins if s["id"] not in existing_ids]
                 
                 if new_skins:
-                    logger.info(f"🆕 {len(new_skins)} yeni skin bulundu! Buluta (Supabase) aktarılıyor...")
-                    batch_data = [{"skin_id": s["id"], "skin_name": s["name"], "wear_value": s.get("wear_value", "")} for s in new_skins]
-                    saved_ok = await asyncio.to_thread(save_skins_batch, batch_data)
-                    if saved_ok:
+                    # Önce Master'ın kendi yerel işçilerini (queue) DB'ye gitmeden doğrudan besle (0 DB IO)
+                    local_need = max(0, MAX_WORKERS - queue.qsize())
+                    local_skins = new_skins[:local_need]
+                    remote_skins = new_skins[local_need:]
+
+                    if local_skins:
+                        from database import _cache_lock, _known_skin_ids_cache
+                        with _cache_lock:
+                            for s in local_skins:
+                                _known_skin_ids_cache.add(s["id"])
+                        for i in range(0, len(local_skins), BATCH_SIZE):
+                            slice_items = local_skins[i:i + BATCH_SIZE]
+                            worker_items = [{
+                                "id": s["id"],
+                                "name": s["name"],
+                                "wear_value": s.get("wear_value", ""),
+                                "url": f"{TARGET_BASE_URL}/market/goods/{s['id']}?game=csgo"
+                            } for s in slice_items]
+                            await queue.put(worker_items)
+                        logger.info(f"⚡ [Monitor] {len(local_skins)} taze skin doğrudan yerel işçilere (DB'siz) aktarıldı.")
+
+                    if remote_skins:
+                        logger.info(f"🆕 {len(remote_skins)} yeni skin diğer Worker'lar için buluta (Supabase) aktarılıyor...")
+                        batch_data = [{"skin_id": s["id"], "skin_name": s["name"], "wear_value": s.get("wear_value", "")} for s in remote_skins]
+                        saved_ok = await asyncio.to_thread(save_skins_batch, batch_data)
+                        if saved_ok:
+                            if new_first_id and new_first_id != current_last_scanned_id:
+                                await asyncio.to_thread(set_last_scanned_id, new_first_id, new_first_name)
+                            new_work_event.set()
+                        else:
+                            db_congested = True
+                            logger.warning("[Monitor] Skinler buluta kaydedilemediği için 'last_scanned_id' güncellenmedi; veritabanı rahatlaması için ekstra beklenecek.")
+                    else:
                         if new_first_id and new_first_id != current_last_scanned_id:
                             await asyncio.to_thread(set_last_scanned_id, new_first_id, new_first_name)
-                        new_work_event.set()
-                    else:
-                        db_congested = True
-                        logger.warning("[Monitor] Skinler buluta kaydedilemediği için 'last_scanned_id' güncellenmedi; veritabanı rahatlaması için ekstra beklenecek.")
                 else:
                     if new_first_id and new_first_id != current_last_scanned_id:
                         await asyncio.to_thread(set_last_scanned_id, new_first_id, new_first_name)
@@ -127,21 +152,23 @@ async def monitor_task(scraper: DataScraper, new_work_event: asyncio.Event):
 
 async def dispatcher_task(queue: asyncio.Queue, new_work_event: asyncio.Event):
     """
-    İşçiler için Supabase'den RPC ile iş çeker (Adaptive Backoff + Event destekli).
-    Aynı anda alınan iş db'den silineceği için VM ile çakışma olmaz.
+    İşçiler için Supabase'den RPC ile iş çeker (Kademeli Backoff: 5 -> 15 -> 35 -> 45 sn).
     """
-    logger.info("[Dispatcher] Supabase kuyruk çekicisi başlatıldı.")
+    logger.info("[Dispatcher] Supabase kuyruk çekicisi başlatıldı (Kademeli Backoff: 5/15/35/45s).")
     
-    fetch_interval = 4.0
-    pull_limit = max(BATCH_SIZE * MAX_WORKERS, 5)
+    backoff_steps = (5.0, 15.0, 35.0, 45.0)
+    empty_streak = 0
+    fetch_interval = 5.0
+    pull_limit = max(BATCH_SIZE * MAX_WORKERS, 8)
     
     while running:
-        if queue.qsize() < 3:
+        if queue.qsize() <= 1:
             try:
                 batch = await asyncio.to_thread(get_work_batch, pull_limit)
                 if batch:
-                    fetch_interval = 4.0
-                    logger.info(f"[Dispatcher] Veritabanından {len(batch)} adet ürün işlenmek üzere çekildi.")
+                    empty_streak = 0
+                    fetch_interval = 5.0
+                    logger.info(f"[Dispatcher] Veritabanından {len(batch)} adet en güncel ürün çekildi.")
                     for i in range(0, len(batch), BATCH_SIZE):
                         slice_items = batch[i:i + BATCH_SIZE]
                         worker_items = []
@@ -154,17 +181,21 @@ async def dispatcher_task(queue: asyncio.Queue, new_work_event: asyncio.Event):
                             })
                         await queue.put(worker_items)
                 else:
-                    # Kuyruk boşsa bekleme süresini kademeli olarak 12 saniyeye kadar çıkar
-                    fetch_interval = min(fetch_interval + 2.0, 12.0)
+                    fetch_interval = backoff_steps[min(empty_streak, len(backoff_steps) - 1)]
+                    empty_streak += 1
+                    logger.info(f"[Dispatcher] Kuyruk boş (Deneme #{empty_streak}). {fetch_interval:.0f} sn bekleniyor...")
             except Exception as e:
                 logger.error(f"[Dispatcher] İş çekme hatası: {e}")
-                fetch_interval = 10.0
+                fetch_interval = 35.0
+        else:
+            fetch_interval = 5.0
                 
         # Boş bekleyişlerde Monitor yeni iş eklerse anında uyan
         new_work_event.clear()
         try:
             await asyncio.wait_for(new_work_event.wait(), timeout=fetch_interval)
-            fetch_interval = 2.0
+            empty_streak = 0
+            fetch_interval = 5.0
         except asyncio.TimeoutError:
             pass
 
@@ -296,8 +327,8 @@ async def main_async():
     new_work_event = asyncio.Event()
     tasks = []
     
-    # 1. Ana sayfayı tarayıp Supabase'e iten monitor
-    monitor = asyncio.create_task(monitor_task(scraper, new_work_event))
+    # 1. Ana sayfayı tarayıp önce yerel işçileri, fazlasıyla Supabase'i besleyen monitor
+    monitor = asyncio.create_task(monitor_task(scraper, queue, new_work_event))
     tasks.append(monitor)
     
     # 2. İşleri Supabase'den çekip kuyruğa ekleyen dağıtıcı
