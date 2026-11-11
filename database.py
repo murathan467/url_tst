@@ -2,25 +2,31 @@
 """
 Cloud Task Sync — Veritabanı Modülü (Supabase)
 Optimize Edilmiş Versiyon: Kilitsiz (Non-Blocking) Thread İstekleri, RAM Cache,
-Otomatik 5000/4000 Temizliği (Trim), Upsert Ignore Duplicates ve Dengeli Timeout.
+Otomatik 5000/4000 Temizliği (Trim), Upsert Ignore Duplicates, Returning Minimal ve Kademeli Backoff.
 """
 
-import time
-import logging
-import threading
 import asyncio
 from datetime import datetime
-from supabase import create_client, Client, ClientOptions
+import logging
+import threading
+import time
 
-from config import SUPABASE_URL, SUPABASE_KEY
+from config import SUPABASE_KEY, SUPABASE_URL
 import httpx
+from supabase import Client, ClientOptions, create_client
 
-# httpx seviyesinde HTTP/2'yi kapat ve Supabase 8s statement_timeout ile uyumlu dengeli timeout uygula
+# httpx seviyesinde HTTP/2'yi kapat ve hiçbir işlemin 10 saniyeden fazla asılı kalmamasını garantile
 _original_client_init = httpx.Client.__init__
+
+
 def _patched_client_init(self, *args, **kwargs):
-    kwargs['http2'] = False
-    kwargs['timeout'] = httpx.Timeout(12.0, connect=5.0, read=10.0, write=10.0, pool=5.0)
+    kwargs["http2"] = False
+    kwargs["timeout"] = httpx.Timeout(
+        10.0, connect=5.0, read=10.0, write=10.0, pool=5.0
+    )
     _original_client_init(self, *args, **kwargs)
+
+
 httpx.Client.__init__ = _patched_client_init
 
 logger = logging.getLogger(__name__)
@@ -35,31 +41,33 @@ db_semaphore = asyncio.Semaphore(5)
 # ==========================================================
 # DİSK IO OPTİMİZASYONU: BELLEK İÇİ ÖNBELLEKLER (RAM CACHE)
 # ==========================================================
-_notified_cache = set()          # (skin_name, seller, float_value)
-_known_skin_ids_cache = set()    # Bilinen skin_id'ler
+_notified_cache = set()  # (skin_name, seller, float_value)
+_known_skin_ids_cache = set()  # Bilinen skin_id'ler
 _skin_ids_cache_loaded = False
-_last_scanned_id_cache = None    # Son taranan skin_id
-_last_state_sync_time = 0.0      # system_state tablosuna son yazma zamanı (Throttling)
-_skin_insert_buffer = []         # Tekli save_skin çağrıları için tampon
+_last_scanned_id_cache = None  # Son taranan skin_id
+_last_state_sync_time = (
+    0.0  # system_state tablosuna son yazma zamanı (Throttling)
+)
+_skin_insert_buffer = []  # Tekli save_skin çağrıları için tampon
 
 
-def _get_or_create_client(force_recreate: bool = False, failed_client: Client = None) -> Client:
-    """
-    Thread-safe olarak Supabase istemcisini döndürür.
-    Ağ isteği sırasında kilit TUTMAZ; sadece istemci referansı alınırken kilit kullanılır.
+def _get_or_create_client() -> Client:
+    """Thread-safe olarak mevcut Supabase istemcisini döndürür.
+
+    Hata anında istemciyi sıfırdan oluşturmaz; mevcut TCP/SSL havuzunu korur.
     """
     global supabase
+    if supabase is not None:
+        return supabase
+
     with _client_lock:
-        if supabase is not None and not force_recreate:
-            return supabase
-        if force_recreate and failed_client is not None and supabase is not failed_client and supabase is not None:
-            # Başka bir thread zaten istemciyi yenilemiş
+        if supabase is not None:
             return supabase
 
         options = ClientOptions(postgrest_client_timeout=10)
         client = create_client(SUPABASE_URL, SUPABASE_KEY, options=options)
 
-        if hasattr(client, 'postgrest') and hasattr(client.postgrest, 'client'):
+        if hasattr(client, "postgrest") and hasattr(client.postgrest, "client"):
             try:
                 client.postgrest.client._http2 = False
             except Exception:
@@ -93,29 +101,34 @@ def _is_recoverable_network_error(err: Exception) -> bool:
     return any(k in msg for k in keywords)
 
 
-def _execute_with_retry(operation_fn, action_name: str = "DB İşlemi", retries: int = 1):
+def _execute_with_retry(
+    operation_fn, action_name: str = "DB İşlemi", retries: int = 2
+):
+    """Supabase sorgularını global kilit tutmadan (non-blocking) çalıştırır.
+
+    Hata alındığında yeni bağlantı açıp sunucuyu boğmak yerine mevcut istemciyle
+    ilk hatada 10 saniye, ikinci hatada 25 saniye bekleyerek (backoff) tekrar
+    dener.
     """
-    Supabase sorgularını global kilit tutmadan (non-blocking) çalıştırır.
-    Böylece Bulk Upsert ve get_work_batch birbirini Python tarafında asla bloklamaz.
-    """
+    backoff_durations = (10.0, 25.0)
     last_err = None
+    client = _get_or_create_client()
+
     for attempt in range(retries + 1):
-        client = _get_or_create_client()
         try:
             return operation_fn(client)
         except Exception as e:
             last_err = e
             if _is_recoverable_network_error(e) and attempt < retries:
-                backoff = 1.5 * (attempt + 1)
+                backoff = backoff_durations[
+                    min(attempt, len(backoff_durations) - 1)
+                ]
                 logger.warning(
-                    f"[DB Retry] '{action_name}' sırasında ağ/zaman aşımı ({e}). "
-                    f"{backoff:.1f} sn sonra bağlantı yenilenip tekrar denenecek (Deneme {attempt + 1}/{retries})..."
+                    f"[DB Retry] '{action_name}' sırasında ağ/zaman aşımı"
+                    f" ({e}). {backoff:.0f} sn beklenip mevcut bağlantıyla"
+                    f" tekrar denenecek (Deneme {attempt + 1}/{retries})..."
                 )
                 time.sleep(backoff)
-                try:
-                    _get_or_create_client(force_recreate=True, failed_client=client)
-                except Exception:
-                    pass
             else:
                 break
     raise last_err
@@ -123,7 +136,7 @@ def _execute_with_retry(operation_fn, action_name: str = "DB İşlemi", retries:
 
 def init_db():
     try:
-        _get_or_create_client(force_recreate=True)
+        _get_or_create_client()
         logger.info("Supabase bağlantısı başarıyla başlatıldı.")
         _preload_notified_cache()
     except Exception as e:
@@ -147,9 +160,16 @@ def _preload_notified_cache():
         if res.data:
             with _cache_lock:
                 for row in res.data:
-                    key = (row.get("skin_name", ""), row.get("seller", ""), row.get("float_value", ""))
+                    key = (
+                        row.get("skin_name", ""),
+                        row.get("seller", ""),
+                        row.get("float_value", ""),
+                    )
                     _notified_cache.add(key)
-            logger.info(f"[RAM Cache] {len(_notified_cache)} adet geçmiş bildirim önbelleğe yüklendi.")
+            logger.info(
+                f"[RAM Cache] {len(_notified_cache)} adet geçmiş bildirim"
+                " önbelleğe yüklendi."
+            )
     except Exception as e:
         logger.debug(f"Önbellek yükleme uyarısı: {e}")
 
@@ -160,7 +180,11 @@ def is_skin_exists(skin_id: str) -> bool:
             return True
     try:
         response = _execute_with_retry(
-            lambda client: client.table("skins").select("id").eq("skin_id", skin_id).limit(1).execute(),
+            lambda client: client.table("skins")
+            .select("id")
+            .eq("skin_id", skin_id)
+            .limit(1)
+            .execute(),
             action_name="is_skin_exists",
             retries=1,
         )
@@ -175,16 +199,18 @@ def is_skin_exists(skin_id: str) -> bool:
 
 
 def save_skin(skin_id: str, skin_name: str = "", wear_value: str = ""):
-    """Tekli çağrıları tamponda biriktirip 20'şerli toplu yazar."""
+    """Tekli çağrıları tamponda biriktirip 50'şerli toplu yazar."""
     with _cache_lock:
         if skin_id in _known_skin_ids_cache:
             return
-        _skin_insert_buffer.append({
-            "skin_id": skin_id,
-            "skin_name": skin_name,
-            "wear_value": wear_value
-        })
-        should_flush = len(_skin_insert_buffer) >= 20
+        _skin_insert_buffer.append(
+            {
+                "skin_id": skin_id,
+                "skin_name": skin_name,
+                "wear_value": wear_value,
+            }
+        )
+        should_flush = len(_skin_insert_buffer) >= 50
     if should_flush:
         flush_skin_buffer()
 
@@ -200,10 +226,10 @@ def flush_skin_buffer():
 
 
 def save_skins_batch(skins_list: list) -> bool:
-    """
-    Toplu Ekleme (Bulk Upsert) - Çakışan (Duplicate) kayıtları sessizce yoksayar,
-    sadece yeni olanları küçük parçalar halinde yazar.
-    Başarılıysa True, hata oluştuysa False döner.
+    """Toplu Ekleme (Bulk Upsert) - Çakışan (Duplicate) kayıtları sessizce yoksayar (ignore_duplicates=True)
+
+    ve eklenen satırları geri döndürmeyerek (returning="minimal") Disk I/O
+    tüketimini minimuma indirir.
     """
     try:
         if not skins_list:
@@ -216,7 +242,11 @@ def save_skins_batch(skins_list: list) -> bool:
         with _cache_lock:
             for skin in skins_list:
                 s_id = skin.get("skin_id")
-                if not s_id or s_id in _known_skin_ids_cache or s_id in seen_in_batch:
+                if (
+                    not s_id
+                    or s_id in _known_skin_ids_cache
+                    or s_id in seen_in_batch
+                ):
                     continue
                 seen_in_batch.add(s_id)
 
@@ -224,46 +254,54 @@ def save_skins_batch(skins_list: list) -> bool:
                     "skin_id": s_id,
                     "skin_name": skin.get("skin_name", ""),
                     "wear_value": skin.get("wear_value", ""),
-                    "processed_at": skin.get("processed_at", now_str)
+                    "processed_at": skin.get("processed_at", now_str),
                 }
                 formatted_list.append(formatted_skin)
 
         if not formatted_list:
             return True
 
-        # 20'şerli parçalar halinde upsert yaparak satır kilit süresini minimumda tut
-        chunk_size = 20
+        # 50'şerli parçalar halinde tek seferde upsert yaparak PostgREST istek yükünü azalt
+        chunk_size = 50
         for i in range(0, len(formatted_list), chunk_size):
-            chunk = formatted_list[i:i + chunk_size]
+            chunk = formatted_list[i : i + chunk_size]
             _execute_with_retry(
-                lambda client, ch=chunk: client.table("skins").upsert(
+                lambda client, ch=chunk: client.table("skins")
+                .upsert(
                     ch,
                     on_conflict="skin_id",
-                    ignore_duplicates=True
-                ).execute(),
+                    ignore_duplicates=True,  # Zaten varsa diske tekrar yazma (ON CONFLICT DO NOTHING)
+                    returning="minimal",  # Eklenen satırları geri döndürme, Disk I/O ve ağ tasarrufu yap
+                )
+                .execute(),
                 action_name=f"Bulk Upsert (skins {i+1}-{i+len(chunk)})",
-                retries=1,
+                retries=2,
             )
 
         with _cache_lock:
             for item in formatted_list:
                 _known_skin_ids_cache.add(item["skin_id"])
 
-        logger.info(f"{len(formatted_list)} adet yeni skin toplu olarak (Bulk Upsert) buluta eklendi.")
+        logger.info(
+            f"{len(formatted_list)} adet yeni skin toplu olarak (Bulk Upsert)"
+            " buluta eklendi."
+        )
         return True
     except Exception as e:
         logger.error(f"Toplu skin kaydetme hatası (Bulk Upsert): {e}")
         return False
 
 
-def _trim_table_by_pk(table_name: str, max_rows: int = 5000, delete_count: int = 4000) -> int:
-    """
-    Primary Key (id) indeksini kullanarak COUNT(*) tablosu taraması yapmadan
-    tablo boyutu max_rows'u (5000) aşmışsa en eski delete_count (4000) kaydı siler.
+def _trim_table_by_pk(
+    table_name: str, max_rows: int = 5000, delete_count: int = 4000
+) -> int:
+    """Primary Key (id) indeksini kullanarak COUNT(*) tablosu taraması yapmadan
+
+    tablo boyutu max_rows'u (5000) aşmışsa en eski delete_count (4000) kaydı
+    siler.
     """
     try:
         client = _get_or_create_client()
-        # 1. Tabloda en az max_rows (5000) kayıt var mı? (Primary key üzerinden 0.2ms sürer)
         check_res = (
             client.table(table_name)
             .select("id")
@@ -274,7 +312,6 @@ def _trim_table_by_pk(table_name: str, max_rows: int = 5000, delete_count: int =
         if not check_res.data:
             return 0
 
-        # 2. En eski 4000. kaydın ID'sini bul
         cutoff_res = (
             client.table(table_name)
             .select("id")
@@ -286,7 +323,9 @@ def _trim_table_by_pk(table_name: str, max_rows: int = 5000, delete_count: int =
             return 0
 
         cutoff_id = cutoff_res.data[0]["id"]
-        client.table(table_name).delete().lt("id", cutoff_id).execute()
+        client.table(table_name).delete(returning="minimal").lt(
+            "id", cutoff_id
+        ).execute()
         return delete_count
     except Exception as e:
         logger.debug(f"[{table_name}] PK tabanlı temizlik uyarısı: {e}")
@@ -294,9 +333,10 @@ def _trim_table_by_pk(table_name: str, max_rows: int = 5000, delete_count: int =
 
 
 def trim_old_skins(max_rows: int = 5000, delete_count: int = 4000) -> int:
-    """
-    Veritabanındaki kayıt sayısı 5000'i geçerse en eski 4000 taneyi otomatik olarak siler.
-    Önce Supabase'deki 'trim_old_skins' RPC fonksiyonunu dener; yoksa indeks tabanlı temizlik yapar.
+    """Veritabanındaki kayıt sayısı 5000'i geçerse en eski 4000 taneyi otomatik olarak siler.
+
+    Önce Supabase'deki 'trim_old_skins' RPC fonksiyonunu dener; yoksa indeks
+    tabanlı temizlik yapar.
     """
     total_deleted = 0
     try:
@@ -305,15 +345,21 @@ def trim_old_skins(max_rows: int = 5000, delete_count: int = 4000) -> int:
         if isinstance(res.data, int):
             total_deleted = res.data
     except Exception:
-        # RPC henüz tanımlanmamışsa doğrudan PK indeks tabanlı temizliği çalıştır
-        deleted_s = _trim_table_by_pk("skins", max_rows=max_rows, delete_count=delete_count)
-        deleted_n = _trim_table_by_pk("notified_bargains", max_rows=max_rows, delete_count=delete_count)
+        deleted_s = _trim_table_by_pk(
+            "skins", max_rows=max_rows, delete_count=delete_count
+        )
+        deleted_n = _trim_table_by_pk(
+            "notified_bargains", max_rows=max_rows, delete_count=delete_count
+        )
         total_deleted = deleted_s + deleted_n
 
     if total_deleted > 0:
         with _cache_lock:
             _known_skin_ids_cache.clear()
-        logger.info(f"🧹 Veritabanı temizliği: En eski {total_deleted} kayıt silindi ({max_rows} sınırı aşıldı).")
+        logger.info(
+            f"🧹 Veritabanı temizliği: En eski {total_deleted} kayıt silindi"
+            f" ({max_rows} sınırı aşıldı)."
+        )
     return total_deleted
 
 
@@ -342,7 +388,10 @@ def clear_all_skins():
 
     try:
         _execute_with_retry(
-            lambda client: client.table("skins").delete().neq("id", -1).execute(),
+            lambda client: client.table("skins")
+            .delete(returning="minimal")
+            .neq("id", -1)
+            .execute(),
             action_name="clear_all_skins",
             retries=1,
         )
@@ -353,7 +402,7 @@ def clear_all_skins():
     try:
         _execute_with_retry(
             lambda client: client.table("system_state")
-            .delete()
+            .delete(returning="minimal")
             .in_("key_name", ["last_scanned_id", "last_scanned_name"])
             .execute(),
             action_name="clear_system_state",
@@ -392,9 +441,10 @@ def get_last_scanned_id() -> str:
 
 
 def set_last_scanned_id(skin_id: str, skin_name: str = ""):
-    """
-    Son okunan eşyayı anında RAM'de günceller.
-    Veritabanı IO ve ağ tıkanıklığını önlemek için Supabase'e en fazla 60 saniyede bir yazar.
+    """Son okunan eşyayı anında RAM'de günceller.
+
+    Veritabanı IO ve ağ tıkanıklığını önlemek için Supabase'e en fazla 60
+    saniyede bir yazar.
     """
     global _last_scanned_id_cache, _last_state_sync_time
     with _cache_lock:
@@ -411,18 +461,37 @@ def set_last_scanned_id(skin_id: str, skin_name: str = ""):
     try:
         now_str = datetime.utcnow().isoformat()
         updates = [
-            {"key_name": "last_scanned_id", "key_value": skin_id, "updated_at": now_str}
+            {
+                "key_name": "last_scanned_id",
+                "key_value": skin_id,
+                "updated_at": now_str,
+            }
         ]
         if skin_name:
-            updates.append({"key_name": "last_scanned_name", "key_value": skin_name, "updated_at": now_str})
+            updates.append(
+                {
+                    "key_name": "last_scanned_name",
+                    "key_value": skin_name,
+                    "updated_at": now_str,
+                }
+            )
 
         _execute_with_retry(
-            lambda client: client.table("system_state").upsert(updates, on_conflict="key_name").execute(),
+            lambda client: client.table("system_state")
+            .upsert(
+                updates,
+                on_conflict="key_name",
+                returning="minimal",
+            )
+            .execute(),
             action_name="set_last_scanned_id",
             retries=1,
         )
     except Exception as e:
-        logger.debug(f"Son taranan eşya DB senkronizasyon uyarısı (RAM üzerinden devam ediliyor): {e}")
+        logger.debug(
+            "Son taranan eşya DB senkronizasyon uyarısı (RAM üzerinden devam"
+            f" ediliyor): {e}"
+        )
 
 
 def get_all_skin_ids() -> set:
@@ -436,7 +505,10 @@ def get_all_skin_ids() -> set:
 
     try:
         response = _execute_with_retry(
-            lambda client: client.table("skins").select("skin_id").limit(2000).execute(),
+            lambda client: client.table("skins")
+            .select("skin_id")
+            .limit(2000)
+            .execute(),
             action_name="get_all_skin_ids",
             retries=1,
         )
@@ -451,14 +523,14 @@ def get_all_skin_ids() -> set:
 
 
 def get_work_batch(limit: int) -> list:
-    """
-    Supabase'den en fazla 'limit' kadar ürünü alır ve atomik olarak siler.
-    """
+    """Supabase'den en fazla 'limit' kadar ürünü alır ve atomik olarak siler."""
     try:
         response = _execute_with_retry(
-            lambda client: client.rpc("get_and_delete_skins", {"batch_limit": limit}).execute(),
+            lambda client: client.rpc(
+                "get_and_delete_skins", {"batch_limit": limit}
+            ).execute(),
             action_name="get_work_batch (RPC)",
-            retries=1,
+            retries=2,
         )
         data = response.data or []
         if data:
@@ -471,7 +543,9 @@ def get_work_batch(limit: int) -> list:
         return []
 
 
-def is_bargain_notified(skin_name: str, seller: str, float_value: str = "") -> bool:
+def is_bargain_notified(
+    skin_name: str, seller: str, float_value: str = ""
+) -> bool:
     key = (skin_name, seller, float_value)
     with _cache_lock:
         if key in _notified_cache:
@@ -510,24 +584,40 @@ def mark_bargain_notified(skin_name: str, seller: str, float_value: str = ""):
 
     try:
         _execute_with_retry(
-            lambda client: client.table("notified_bargains").insert({
-                "skin_name": skin_name,
-                "seller": seller,
-                "float_value": float_value,
-                "notified_at": datetime.utcnow().isoformat()
-            }).execute(),
+            lambda client: client.table("notified_bargains")
+            .upsert(
+                {
+                    "skin_name": skin_name,
+                    "seller": seller,
+                    "float_value": float_value,
+                    "notified_at": datetime.utcnow().isoformat(),
+                },
+                on_conflict="skin_name,seller,float_value",
+                ignore_duplicates=True,
+                returning="minimal",  # Eklenen satırı geri döndürmeyerek Disk I/O tasarrufu yapar
+            )
+            .execute(),
             action_name="mark_bargain_notified",
             retries=1,
         )
-        logger.debug(f"Bargain DB'ye kaydedildi: {skin_name} - Satıcı: {seller} - Float: {float_value}")
+        logger.debug(
+            f"Bargain DB'ye kaydedildi: {skin_name} - Satıcı: {seller} - Float:"
+            f" {float_value}"
+        )
     except Exception as e:
-        if "duplicate key value" not in str(e).lower() and "violates unique constraint" not in str(e).lower():
+        if (
+            "duplicate key value" not in str(e).lower()
+            and "violates unique constraint" not in str(e).lower()
+        ):
             logger.error(f"Bargain kaydetme hatası: {e}")
 
 
 def log_skipped_bargain(skin_name: str, seller: str, float_value: str = ""):
-    """
-    DİSK IO KORUMASI: Atlanan her ürünü veritabanına INSERT etmek Disk IO bütçesini
+    """DİSK IO KORUMASI: Atlanan her ürünü veritabanına INSERT etmek Disk IO bütçesini
+
     tükettiği için sadece konsola/log dosyasına yazıyoruz.
     """
-    logger.debug(f"[Atlandı - DB Yazılmadı] {skin_name} - Satıcı: {seller} - Float: {float_value}")
+    logger.debug(
+        f"[Atlandı - DB Yazılmadı] {skin_name} - Satıcı: {seller} - Float:"
+        f" {float_value}"
+    )
