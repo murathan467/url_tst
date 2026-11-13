@@ -72,13 +72,14 @@ BEGIN
         GET DIAGNOSTICS deleted_rows = ROW_COUNT;
     END IF;
 
-    -- Bildirim tablosunun da RAM'de şişmesini önle (En son 300 bildirimi tut)
-    IF EXISTS (SELECT 1 FROM public.notified_bargains OFFSET 300 LIMIT 1) THEN
+    -- Bildirim tablosunun da RAM'de şişmesini önle (En son 3000 bildirimi PK aralık silmesiyle tut)
+    IF EXISTS (SELECT 1 FROM public.notified_bargains OFFSET 3000 LIMIT 1) THEN
         DELETE FROM public.notified_bargains
-        WHERE id IN (
+        WHERE id <= (
             SELECT id FROM public.notified_bargains
             ORDER BY id DESC
-            OFFSET 300
+            OFFSET 3000
+            LIMIT 1
         );
     END IF;
 
@@ -91,6 +92,13 @@ ALTER TABLE public.skins SET (
     autovacuum_vacuum_scale_factor = 0.02,
     autovacuum_vacuum_threshold = 50,
     autovacuum_analyze_scale_factor = 0.02,
+    autovacuum_analyze_threshold = 50
+);
+
+ALTER TABLE public.notified_bargains SET (
+    autovacuum_vacuum_scale_factor = 0.05,
+    autovacuum_vacuum_threshold = 50,
+    autovacuum_analyze_scale_factor = 0.05,
     autovacuum_analyze_threshold = 50
 );
 

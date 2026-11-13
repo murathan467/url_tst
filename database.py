@@ -182,20 +182,31 @@ def init_db():
 
 
 def _preload_notified_cache():
-    """Başlangıçta son 300 bildirimi FIFO RAM önbelleğine çeker, tekrarlayan SELECT sorgularını önler."""
+    """Başlangıçta son 3000 bildirimi sayfalı (1000'erlik) olarak FIFO RAM önbelleğine çeker."""
     try:
-        res = _execute_with_retry(
-            lambda client: client.table("notified_bargains")
-            .select("skin_name, seller, float_value")
-            .order("id", desc=True)
-            .limit(300)
-            .execute(),
-            action_name="Preload Notified Cache",
-            retries=1,
-        )
-        if res.data:
+        all_rows = []
+        page_size = 1000
+        for offset in range(0, NOTIFIED_CACHE_MAX, page_size):
+            end_idx = min(offset + page_size - 1, NOTIFIED_CACHE_MAX - 1)
+            res = _execute_with_retry(
+                lambda client, start=offset, end=end_idx: client.table(
+                    "notified_bargains"
+                )
+                .select("skin_name, seller, float_value")
+                .order("id", desc=True)
+                .range(start, end)
+                .execute(),
+                action_name=f"Preload Notified Cache ({offset}-{end_idx})",
+                retries=1,
+            )
+            batch = res.data or []
+            all_rows.extend(batch)
+            if len(batch) < (end_idx - offset + 1):
+                break
+
+        if all_rows:
             with _cache_lock:
-                for row in reversed(res.data):
+                for row in reversed(all_rows):
                     key = (
                         row.get("skin_name", ""),
                         row.get("seller", ""),
@@ -394,7 +405,7 @@ def trim_old_skins(max_rows: int = 150, delete_count: int = 100) -> int:
             "skins", max_rows=max_rows, delete_count=delete_count
         )
         deleted_n = _trim_table_by_pk(
-            "notified_bargains", max_rows=300, delete_count=150
+            "notified_bargains", max_rows=NOTIFIED_CACHE_MAX, delete_count=200
         )
         total_deleted = deleted_s + deleted_n
 
