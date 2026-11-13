@@ -24,6 +24,7 @@ from config import (
     WS_MAX_RETRIES,
     WS_RECONNECT_PROBE_INTERVAL,
     WS_RETRY_DELAYS,
+    WS_STARTUP_EMPTY_WAIT,
 )
 from database import (
     get_work_batch,
@@ -138,6 +139,19 @@ async def _try_ws_connect_up_to_4_times(node_name: str):
     return None
 
 
+async def _wait_for_initial_ws_url(max_wait: float = WS_STARTUP_EMPTY_WAIT):
+    """İlk açılışta Master Node tüneli henüz yayınlamadıysa boş ws_url yüzünden 4 deneme hakkını harcamaz."""
+    deadline = time.time() + max_wait
+    while running and time.time() < deadline:
+        ws_url = await asyncio.to_thread(get_ws_url)
+        if ws_url and (ws_url.startswith("wss://") or ws_url.startswith("ws://")):
+            # Yeni trycloudflare.com alt alan adının DNS yayılımı için kısa bekleme
+            await _sleep_interruptible(3.0)
+            return
+        logger.info("[WS Client] Master tünel adresi bekleniyor (ws_url henüz boş)...")
+        await _sleep_interruptible(min(6.0, max(0.5, deadline - time.time())))
+
+
 async def ws_client_task(queue: asyncio.Queue, node_name: str):
     """
     Birincil WebSocket alıcısı. En fazla 4 denemede bağlanamazsa veya tünel koparsa
@@ -151,7 +165,12 @@ async def ws_client_task(queue: asyncio.Queue, node_name: str):
         logger.info("[WS Client] WebSocket devre dışı veya paket yok; Supabase modunda çalışılacak.")
         return
 
+    first_boot = True
     while running:
+        if first_boot:
+            await _wait_for_initial_ws_url()
+            first_boot = False
+
         ws = await _try_ws_connect_up_to_4_times(node_name)
         if ws is not None:
             ws_active = True

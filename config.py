@@ -102,7 +102,8 @@ WS_AUTH_TOKEN = os.getenv("WS_AUTH_TOKEN", "").strip() or (
     if SUPABASE_KEY else ""
 )
 WS_MAX_RETRIES = 4
-WS_RETRY_DELAYS = (4.0, 6.0, 8.0, 10.0)
+WS_RETRY_DELAYS = (6.0, 10.0, 14.0, 15.0)
+WS_STARTUP_EMPTY_WAIT = 45.0  # İlk açılışta Master tüneli yayınlayana kadar boş ws_url için bekleme sınırı
 WS_RECONNECT_PROBE_INTERVAL = 600.0  # Fallback modunda 10 dakikada bir tüneli yokla
 DISPATCHER_BACKOFF_STEPS = (2.5, 4.0, 6.0, 9.0)
 KNOWN_SKIN_CACHE_MAX = 3000
