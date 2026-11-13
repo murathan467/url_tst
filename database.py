@@ -6,12 +6,18 @@ Otomatik 5000/4000 Temizliği (Trim), Upsert Ignore Duplicates, Returning Minima
 """
 
 import asyncio
+from collections import OrderedDict
 from datetime import datetime
 import logging
 import threading
 import time
 
-from config import SUPABASE_KEY, SUPABASE_URL
+from config import (
+    KNOWN_SKIN_CACHE_MAX,
+    NOTIFIED_CACHE_MAX,
+    SUPABASE_KEY,
+    SUPABASE_URL,
+)
 import httpx
 from supabase import Client, ClientOptions, create_client
 
@@ -25,7 +31,7 @@ def _patched_client_init(self, *args, **kwargs):
         10.0, connect=5.0, read=10.0, write=10.0, pool=5.0
     )
     kwargs["limits"] = httpx.Limits(
-        max_connections=2, max_keepalive_connections=1, keepalive_expiry=15.0
+        max_connections=5, max_keepalive_connections=3, keepalive_expiry=65.0
     )
     _original_client_init(self, *args, **kwargs)
 
@@ -42,16 +48,40 @@ _cache_lock = threading.RLock()
 db_semaphore = asyncio.Semaphore(1)
 
 # ==========================================================
-# DİSK IO OPTİMİZASYONU: BELLEK İÇİ ÖNBELLEKLER (RAM CACHE)
+# DİSK IO OPTİMİZASYONU: BELLEK İÇİ ÖNBELLEKLER (RAM CACHE - FIFO)
 # ==========================================================
-_notified_cache = set()  # (skin_name, seller, float_value)
-_known_skin_ids_cache = set()  # Bilinen skin_id'ler
+_notified_cache: OrderedDict = OrderedDict()  # (skin_name, seller, float_value) -> None
+_known_skin_ids_cache: OrderedDict = OrderedDict()  # skin_id -> None
 _skin_ids_cache_loaded = False
 _last_scanned_id_cache = None  # Son taranan skin_id
+_last_scanned_name_cache = ""  # Son taranan skin_name
+_last_synced_scanned_id = None  # Supabase'e en son yazılan skin_id
 _last_state_sync_time = (
     0.0  # system_state tablosuna son yazma zamanı (Throttling)
 )
 _skin_insert_buffer = []  # Tekli save_skin çağrıları için tampon
+
+
+def _cache_put_fifo(
+    cache: OrderedDict, key, max_size: int = KNOWN_SKIN_CACHE_MAX
+):
+    """Önbelleğe FIFO sırayla ekler; kapasite aşımında en eski kaydı çıkarır."""
+    if key in cache:
+        cache.move_to_end(key)
+        return
+    cache[key] = None
+    while len(cache) > max_size:
+        cache.popitem(last=False)
+
+
+def add_known_skin_ids(skin_ids) -> None:
+    """Verilen skin_id koleksiyonunu 3000 kapasiteli FIFO OrderedDict önbelleğine ekler."""
+    with _cache_lock:
+        for s_id in skin_ids:
+            if s_id:
+                _cache_put_fifo(
+                    _known_skin_ids_cache, s_id, KNOWN_SKIN_CACHE_MAX
+                )
 
 
 def _get_or_create_client() -> Client:
@@ -142,33 +172,36 @@ def init_db():
         _get_or_create_client()
         logger.info("Supabase bağlantısı başarıyla başlatıldı.")
         _preload_notified_cache()
+        last_id = get_last_scanned_id()
+        logger.info(
+            f"[Kalıcı Hafıza] Başlangıç last_scanned_id: {last_id or '(yok)'}"
+        )
     except Exception as e:
         logger.error(f"Supabase başlatma hatası: {e}")
         raise
 
 
 def _preload_notified_cache():
-    """Başlangıçta son 150 bildirimi RAM'e çeker, tekrarlayan SELECT sorgularını önler."""
-    global _notified_cache
+    """Başlangıçta son 300 bildirimi FIFO RAM önbelleğine çeker, tekrarlayan SELECT sorgularını önler."""
     try:
         res = _execute_with_retry(
             lambda client: client.table("notified_bargains")
             .select("skin_name, seller, float_value")
             .order("id", desc=True)
-            .limit(150)
+            .limit(300)
             .execute(),
             action_name="Preload Notified Cache",
             retries=1,
         )
         if res.data:
             with _cache_lock:
-                for row in res.data:
+                for row in reversed(res.data):
                     key = (
                         row.get("skin_name", ""),
                         row.get("seller", ""),
                         row.get("float_value", ""),
                     )
-                    _notified_cache.add(key)
+                    _cache_put_fifo(_notified_cache, key, NOTIFIED_CACHE_MAX)
             logger.info(
                 f"[RAM Cache] {len(_notified_cache)} adet geçmiş bildirim"
                 " önbelleğe yüklendi."
@@ -194,7 +227,9 @@ def is_skin_exists(skin_id: str) -> bool:
         exists = len(response.data) > 0
         if exists:
             with _cache_lock:
-                _known_skin_ids_cache.add(skin_id)
+                _cache_put_fifo(
+                    _known_skin_ids_cache, skin_id, KNOWN_SKIN_CACHE_MAX
+                )
         return exists
     except Exception as e:
         logger.error(f"Skin kontrolü hatası (skin_id={skin_id}): {e}")
@@ -267,12 +302,9 @@ def save_skins_batch(skins_list: list) -> bool:
         # En güncel verileri önceliklendir: Tek döngüde 3 Worker'ın taze eritebileceğinden fazlasını (max 20) DB'ye yığma
         with _cache_lock:
             for item in formatted_list:
-                _known_skin_ids_cache.add(item["skin_id"])
-            if len(_known_skin_ids_cache) > 500:
-                # Bellek şişmesini önlemek için sadece son 300 ID'yi tut
-                excess = len(_known_skin_ids_cache) - 300
-                for _ in range(excess):
-                    _known_skin_ids_cache.pop()
+                _cache_put_fifo(
+                    _known_skin_ids_cache, item["skin_id"], KNOWN_SKIN_CACHE_MAX
+                )
 
         formatted_list = formatted_list[:20]
 
@@ -381,13 +413,13 @@ async def save_skin_async(skin: dict):
 
 def delete_skin(skin_id: str):
     with _cache_lock:
-        _known_skin_ids_cache.discard(skin_id)
+        _known_skin_ids_cache.pop(skin_id, None)
 
 
 def delete_skins_batch(skin_ids: list):
     with _cache_lock:
         for s_id in skin_ids:
-            _known_skin_ids_cache.discard(s_id)
+            _known_skin_ids_cache.pop(s_id, None)
 
 
 def clear_all_skins():
@@ -426,7 +458,7 @@ def clear_all_skins():
 
 def get_last_scanned_id() -> str:
     """Önce RAM'e bakar. Sadece başlangıçta 1 kere Supabase'e sorar."""
-    global _last_scanned_id_cache
+    global _last_scanned_id_cache, _last_synced_scanned_id
     with _cache_lock:
         if _last_scanned_id_cache is not None:
             return _last_scanned_id_cache
@@ -444,6 +476,7 @@ def get_last_scanned_id() -> str:
         val = response.data[0]["key_value"] if response.data else ""
         with _cache_lock:
             _last_scanned_id_cache = val
+            _last_synced_scanned_id = val
         return val
     except Exception:
         with _cache_lock:
@@ -451,23 +484,31 @@ def get_last_scanned_id() -> str:
         return ""
 
 
-def set_last_scanned_id(skin_id: str, skin_name: str = ""):
+def set_last_scanned_id(skin_id: str, skin_name: str = "", force: bool = False):
     """Son okunan eşyayı anında RAM'de günceller.
 
-    Veritabanı IO ve ağ tıkanıklığını önlemek için Supabase'e en fazla 60
-    saniyede bir yazar.
+    Veritabanı IO ve ağ tıkanıklığını önlemek için Supabase'e en fazla 180
+    saniyede bir yazar (force=True ile kapanışta anında yazılabilir).
     """
-    global _last_scanned_id_cache, _last_state_sync_time
+    global _last_scanned_id_cache, _last_scanned_name_cache, _last_synced_scanned_id, _last_state_sync_time
     with _cache_lock:
-        if not skin_id or skin_id == _last_scanned_id_cache:
+        if not skin_id:
             return
-        _last_scanned_id_cache = skin_id
-        logger.info(f"Son okunan eşya güncellendi: {skin_name} (ID: {skin_id})")
+        if skin_id != _last_scanned_id_cache:
+            _last_scanned_id_cache = skin_id
+            if skin_name:
+                _last_scanned_name_cache = skin_name
+            logger.info(
+                f"Son okunan eşya güncellendi: {skin_name} (ID: {skin_id})"
+            )
+        elif not force or skin_id == _last_synced_scanned_id:
+            return
 
         now_ts = time.time()
-        if now_ts - _last_state_sync_time < 180.0:
+        if not force and now_ts - _last_state_sync_time < 180.0:
             return
         _last_state_sync_time = now_ts
+        name_to_sync = skin_name or _last_scanned_name_cache
 
     try:
         now_str = datetime.utcnow().isoformat()
@@ -478,11 +519,11 @@ def set_last_scanned_id(skin_id: str, skin_name: str = ""):
                 "updated_at": now_str,
             }
         ]
-        if skin_name:
+        if name_to_sync:
             updates.append(
                 {
                     "key_name": "last_scanned_name",
-                    "key_value": skin_name,
+                    "key_value": name_to_sync,
                     "updated_at": now_str,
                 }
             )
@@ -498,6 +539,8 @@ def set_last_scanned_id(skin_id: str, skin_name: str = ""):
             action_name="set_last_scanned_id",
             retries=1,
         )
+        with _cache_lock:
+            _last_synced_scanned_id = skin_id
     except Exception as e:
         logger.debug(
             "Son taranan eşya DB senkronizasyon uyarısı (RAM üzerinden devam"
@@ -505,16 +548,70 @@ def set_last_scanned_id(skin_id: str, skin_name: str = ""):
         )
 
 
+def flush_last_scanned_id():
+    """Kapanış sırasında RAM'deki son taranan ID'yi Supabase'e zorla senkronize eder."""
+    with _cache_lock:
+        skin_id = _last_scanned_id_cache
+        skin_name = _last_scanned_name_cache
+        synced = _last_synced_scanned_id
+    if skin_id and skin_id != synced:
+        set_last_scanned_id(skin_id, skin_name, force=True)
+
+
+def set_ws_url(ws_url: str) -> bool:
+    """Ana botun aktif wss:// tünel adresini system_state tablosuna yazar."""
+    try:
+        now_str = datetime.utcnow().isoformat()
+        _execute_with_retry(
+            lambda client: client.table("system_state")
+            .upsert(
+                {
+                    "key_name": "ws_url",
+                    "key_value": ws_url or "",
+                    "updated_at": now_str,
+                },
+                on_conflict="key_name",
+                returning="minimal",
+            )
+            .execute(),
+            action_name="set_ws_url",
+            retries=2,
+        )
+        logger.info(
+            f"[System State] ws_url güncellendi: {ws_url or '(temizlendi)'}"
+        )
+        return True
+    except Exception as e:
+        logger.error(f"ws_url kaydetme hatası: {e}")
+        return False
+
+
+def get_ws_url() -> str:
+    """Worker botlar için system_state tablosundan güncel wss:// tünel adresini okur."""
+    try:
+        response = _execute_with_retry(
+            lambda client: client.table("system_state")
+            .select("key_value")
+            .eq("key_name", "ws_url")
+            .limit(1)
+            .execute(),
+            action_name="get_ws_url",
+            retries=1,
+        )
+        if response.data:
+            return (response.data[0].get("key_value") or "").strip()
+        return ""
+    except Exception as e:
+        logger.debug(f"ws_url okuma uyarısı: {e}")
+        return ""
+
+
 def get_all_skin_ids() -> set:
-    """Her döngüde tüm tabloyu okumak yerine RAM'deki kümeden yanıt verir."""
+    """Her döngüde tüm tabloyu okumak yerine RAM'deki FIFO önbellekten yanıt verir."""
     global _known_skin_ids_cache, _skin_ids_cache_loaded
     with _cache_lock:
         if _skin_ids_cache_loaded:
-            if len(_known_skin_ids_cache) > 500:
-                excess = len(_known_skin_ids_cache) - 300
-                for _ in range(excess):
-                    _known_skin_ids_cache.pop()
-            return _known_skin_ids_cache.copy()
+            return set(_known_skin_ids_cache.keys())
 
     try:
         response = _execute_with_retry(
@@ -527,13 +624,19 @@ def get_all_skin_ids() -> set:
             retries=1,
         )
         with _cache_lock:
-            _known_skin_ids_cache = {row["skin_id"] for row in response.data}
+            _known_skin_ids_cache.clear()
+            for row in reversed(response.data or []):
+                s_id = row.get("skin_id")
+                if s_id:
+                    _cache_put_fifo(
+                        _known_skin_ids_cache, s_id, KNOWN_SKIN_CACHE_MAX
+                    )
             _skin_ids_cache_loaded = True
-            return _known_skin_ids_cache.copy()
+            return set(_known_skin_ids_cache.keys())
     except Exception as e:
         logger.error(f"Skin ID'lerini çekme hatası: {e}")
         with _cache_lock:
-            return _known_skin_ids_cache.copy()
+            return set(_known_skin_ids_cache.keys())
 
 
 def get_work_batch(limit: int) -> list:
@@ -567,9 +670,7 @@ def mark_bargain_notified(skin_name: str, seller: str, float_value: str = ""):
     with _cache_lock:
         if key in _notified_cache:
             return
-        if len(_notified_cache) > 300:
-            _notified_cache.pop()
-        _notified_cache.add(key)
+        _cache_put_fifo(_notified_cache, key, NOTIFIED_CACHE_MAX)
 
     try:
         _execute_with_retry(

@@ -3,3 +3,4 @@ playwright-stealth
 supabase
 requests
 beautifulsoup4
+websockets>=12.0

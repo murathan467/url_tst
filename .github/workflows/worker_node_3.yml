@@ -63,6 +63,7 @@ jobs:
           FB_PASSWORD: ${{ secrets.FB_PASSWORD_3 || secrets.FB_PASSWORD }}
           TARGET_BASE_URL: ${{ secrets.TARGET_BASE_URL }}
           NODE_NAME: "Worker Node 3"
+          WS_AUTH_TOKEN: ${{ secrets.WS_AUTH_TOKEN }}
         run: |
           echo "Worker Node 3 başlatılıyor (Sadece işçi modu, 5 worker)..."
           end=$((SECONDS+20700))

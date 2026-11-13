@@ -4,13 +4,28 @@
 
 -- 1. İNDEKS VE BELLEK (RAM / SWAP) OPTİMİZASYONU
 -- PRIMARY KEY (id) ve UNIQUE (skin_id, key_name) zaten otomatik B-Tree indeks oluşturur.
--- Kopya indeksleri silerek Supabase'in 411 MB RAM'indeki "Cache + Buffers" yükünü azaltıyoruz.
+-- Kopya indeksleri silerek Supabase'in RAM'indeki "Cache + Buffers" yükünü azaltıyoruz.
 DROP INDEX IF EXISTS public.idx_skins_id;
 DROP INDEX IF EXISTS public.idx_skins_skin_id;
 DROP INDEX IF EXISTS public.idx_skins_processed_at;
+DROP INDEX IF EXISTS public.idx_skins_skin_name;
 DROP INDEX IF EXISTS public.idx_system_state_key;
+DROP INDEX IF EXISTS public.idx_notified_bargains_lookup;
 
-CREATE INDEX IF NOT EXISTS idx_notified_bargains_lookup ON public.notified_bargains (skin_name, seller, float_value);
+CREATE UNIQUE INDEX IF NOT EXISTS notified_bargains_skin_seller_float_key
+ON public.notified_bargains (skin_name, seller, float_value);
+
+-- 1b. skins tablosunu UNLOGGED yap (WAL Disk IO ve 1.16 GB RAM baskısını önler)
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relname = 'skins' AND c.relpersistence <> 'u'
+    ) THEN
+        ALTER TABLE public.skins SET UNLOGGED;
+    END IF;
+END $$;
 
 -- 2. KİLİTLENMEYİ ÖNLEYEN RPC FONKSİYONU (FOR UPDATE SKIP LOCKED — EN GÜNCEL ÖNCELİKLİ)
 -- 4 farklı bot düğümü aynı anda iş çekerken birbirlerinin kilitlediği satırları beklemez (SKIP LOCKED),

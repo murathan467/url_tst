@@ -4,6 +4,7 @@ Cloud Task Sync Worker — Konfigürasyon
 Tüm sabit değerler ve ayarlar burada tanımlanır.
 """
 
+import hashlib
 import os
 
 def _load_env_file():
@@ -89,6 +90,23 @@ MAX_WORKERS = 5
 BATCH_SIZE = 1 
 SCAN_INTERVAL_MIN = 4.5      # Eskisi: 3.5 (Monitor'ün ana sayfayı tarama sıklığı)
 SCAN_INTERVAL_MAX = 6.5      # Eskisi: 5
+
+# ========================
+# WebSocket Tünel & Hibrit Fallback Ayarları
+# ========================
+WS_ENABLED = os.getenv("WS_ENABLED", "true").strip().lower() not in ("0", "false", "no")
+WS_HOST = os.getenv("WS_HOST", "127.0.0.1")
+WS_PORT = int(os.getenv("WS_PORT", "8765"))
+WS_AUTH_TOKEN = os.getenv("WS_AUTH_TOKEN", "").strip() or (
+    hashlib.sha256(f"{SUPABASE_KEY}:ws_tunnel_auth".encode("utf-8")).hexdigest()[:32]
+    if SUPABASE_KEY else ""
+)
+WS_MAX_RETRIES = 4
+WS_RETRY_DELAYS = (4.0, 6.0, 8.0, 10.0)
+WS_RECONNECT_PROBE_INTERVAL = 600.0  # Fallback modunda 10 dakikada bir tüneli yokla
+DISPATCHER_BACKOFF_STEPS = (2.5, 4.0, 6.0, 9.0)
+KNOWN_SKIN_CACHE_MAX = 3000
+NOTIFIED_CACHE_MAX = 3000
 
 # ========================
 # Tarayıcı Ayarları

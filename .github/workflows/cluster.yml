@@ -35,6 +35,12 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
+      - name: Cloudflared Tünel Aracını Kur
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+
       - name: Oturum Çerezlerini Yükle (Varsa)
         env:
           SESSION_COOKIES: ${{ secrets.SESSION_COOKIES || secrets.BUFF_COOKIES }}
@@ -63,6 +69,7 @@ jobs:
           FB_EMAIL: ${{ secrets.FB_EMAIL }}
           FB_PASSWORD: ${{ secrets.FB_PASSWORD }}
           TARGET_BASE_URL: ${{ secrets.TARGET_BASE_URL }}
+          WS_AUTH_TOKEN: ${{ secrets.WS_AUTH_TOKEN }}
         run: |
           echo "Master Node başlatılıyor (Monitor + 5 Worker)..."
           end=$((SECONDS+20700))
@@ -141,6 +148,7 @@ jobs:
           FB_PASSWORD_3: ${{ secrets.FB_PASSWORD_3 }}
           TARGET_BASE_URL: ${{ secrets.TARGET_BASE_URL }}
           NODE_NAME: "Worker Node ${{ matrix.node }}"
+          WS_AUTH_TOKEN: ${{ secrets.WS_AUTH_TOKEN }}
         run: |
           node_id="${NODE_ID}"
           email_var="FB_EMAIL_${node_id}"
