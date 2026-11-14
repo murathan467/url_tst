@@ -2,9 +2,6 @@ name: Cloud Task Worker Node 1
 
 on:
   workflow_dispatch:
-  schedule:
-    # Her 3 saatte bir tetikleme (Önceki çalışıyorsa concurrency kuyruğa alır)
-    - cron: '15 */3 * * *'
 
 permissions:
   contents: write

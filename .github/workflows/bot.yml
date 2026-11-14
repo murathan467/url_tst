@@ -2,9 +2,6 @@ name: Cloud Task Sync Worker
 
 on:
   workflow_dispatch:
-  schedule:
-    # Her 3 saatte bir tetikleme (Önceki job çalışıyorsa concurrency sayesinde kuyruğa alınır ve süre bitince anında başlar)
-    - cron: '0 */3 * * *'
 
 permissions:
   contents: write

@@ -2,9 +2,6 @@ name: Cloud Task Full Cluster (All-in-One)
 
 on:
   workflow_dispatch:
-  schedule:
-    # Her 3 saatte bir yedek tetikleme
-    - cron: '0 */3 * * *'
 
 permissions:
   contents: write
