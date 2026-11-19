@@ -29,7 +29,12 @@ jobs:
       - name: Kütüphaneleri ve Tarayıcı Motorunu Kur
         run: |
           pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+          python -m playwright install chromium
+          python -c "
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              p.chromium.launch(headless=True, args=['--no-sandbox']).close()
+          " || python -m playwright install-deps chromium
 
       - name: Oturum Çerezlerini Yükle (Varsa)
         env:
